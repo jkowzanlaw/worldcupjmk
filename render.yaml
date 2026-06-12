@@ -2,6 +2,22 @@ services:
   - type: worker
     name: worldcupjmk
     runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python poller.py
+    plan: free
+    envVars:
+      - key: FOOTBALL_API_KEY
+        sync: false
+      - key: DROPBOX_TOKEN
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: DROPBOX_FOLDER
+        value: /WorldCupIn5
+services:
+  - type: worker
+    name: worldcupjmk
+    runtime: python
     buildCommand: apt-get install -y libjpeg-dev zlib1g-dev && pip install -r requirements.txt
     startCommand: python poller.py
     plan: free
