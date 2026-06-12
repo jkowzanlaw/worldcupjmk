@@ -1,0 +1,16 @@
+services:
+  - type: worker
+    name: worldcup-in-5-poller
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python poller.py
+    plan: free
+    envVars:
+      - key: FOOTBALL_API_KEY
+        sync: false
+      - key: DROPBOX_TOKEN
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: DROPBOX_FOLDER
+        value: /WorldCupIn5

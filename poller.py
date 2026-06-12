@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+"""
+World Cup in 5 — Autonomous Poller
+Runs 24/7 on Render. Every 3 minutes checks for finished matches,
+generates result cards, uploads to Dropbox. Every morning at 8am ET
+generates the daily schedule card.
+
+Environment variables required (set in Render dashboard):
+  FOOTBALL_API_KEY   — football-data.org API key
+  DROPBOX_TOKEN      — Dropbox access token (long-lived)
+  ANTHROPIC_API_KEY  — Anthropic API key
+  DROPBOX_FOLDER     — e.g. /WorldCupIn5  (default: /WorldCupIn5)
+"""
+
+import os, time, json, logging, requests, schedule
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont
+import dropbox
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+log = logging.getLogger("wc5")
+
+# ── Config from environment ───────────────────────────────────────────────────
+FD_KEY       = os.environ["FOOTBALL_API_KEY"]
+DBX_TOKEN    = os.environ["DROPBOX_TOKEN"]
+CLAUDE_KEY   = os.environ["ANTHROPIC_API_KEY"]
+DBX_FOLDER   = os.environ.get("DROPBOX_FOLDER", "/WorldCupIn5")
+TMP_DIR      = Path("/tmp/wc5"); TMP_DIR.mkdir(exist_ok=True)
+
+# Track which match IDs we've already posted
+POSTED_FILE  = TMP_DIR / "posted.json"
+TOURNAMENT_START = datetime(2026, 6, 11, tzinfo=timezone.utc)
+
+# ── Font paths ────────────────────────────────────────────────────────────────
+# On Render: fonts are downloaded on first run (see download_fonts())
+FONT_DIR   = Path("/tmp/fonts"); FONT_DIR.mkdir(exist_ok=True)
+BEBAS      = str(FONT_DIR / "BebasNeue.ttf")
+POPPINS_B  = str(FONT_DIR / "Poppins-Bold.ttf")
+POPPINS_M  = str(FONT_DIR / "Poppins-Medium.ttf")
+POPPINS_R  = str(FONT_DIR / "Poppins-Regular.ttf")
+
+def download_fonts():
+    """Download fonts to /tmp on first run."""
+    fonts = {
+        BEBAS:     "https://github.com/google/fonts/raw/main/ofl/bebasneue/BebasNeue-Regular.ttf",
+        POPPINS_B: "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Bold.ttf",
+        POPPINS_M: "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Medium.ttf",
+        POPPINS_R: "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Regular.ttf",
+    }
+    for path, url in fonts.items():
+        if not Path(path).exists():
+            log.info(f"Downloading font: {Path(path).name}")
+            r = requests.get(url, timeout=30)
+            Path(path).write_bytes(r.content)
+    log.info("Fonts ready")
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def lf(path, size):
+    try: return ImageFont.truetype(path, size)
+    except: return ImageFont.load_default()
+
+def hr(h): h=h.lstrip("#"); return tuple(int(h[i:i+2],16) for i in (0,2,4))
+def darken(h,f=0.62): r,g,b=hr(h); return (int(r*f),int(g*f),int(b*f))
+
+TEAM_COLORS = {
+    "Argentina":"#74ACDF","Brazil":"#009C3B","France":"#002395",
+    "England":"#CF142B","Spain":"#AA151B","Germany":"#222222",
+    "Portugal":"#006600","United States":"#B22234","USA":"#B22234",
+    "Mexico":"#006847","Canada":"#D80621","Morocco":"#C1272D",
+    "Japan":"#BC002D","Netherlands":"#E77728","Uruguay":"#5EB6E4",
+    "Senegal":"#00853F","Croatia":"#D4263D","Colombia":"#C8A84B",
+    "Nigeria":"#008751","Australia":"#C8A84B","Türkiye":"#E30A17",
+    "Turkey":"#E30A17","South Korea":"#CD2E3A","Iran":"#239F40",
+    "Poland":"#DC143C","Ecuador":"#C8A84B","Paraguay":"#D52B1E",
+    "Switzerland":"#D52B1E","Denmark":"#C60C30","Serbia":"#C6363C",
+    "South Africa":"#007A4D","Bosnia and Herzegovina":"#002F6C",
+    "Saudi Arabia":"#006C35","Ghana":"#006B3F",
+}
+PITCH_DARK=(34,80,18); PITCH_MID=(44,100,24); PITCH_EDGE=(22,55,10)
+
+def get_accent(name):
+    for k,v in TEAM_COLORS.items():
+        if k.lower() in name.lower(): return v
+    return "#1a5c2a"
+
+def centered(d, text, font, y, W, color, shadow=None):
+    bb=d.textbbox((0,0),text,font=font); w=bb[2]-bb[0]; x=(W-w)//2
+    if shadow: d.text((x+3,y+3),text,font=font,fill=shadow)
+    d.text((x,y),text,font=font,fill=color)
+
+def col_text(d, text, font, y, cx, color):
+    bb=d.textbbox((0,0),text,font=font); w=bb[2]-bb[0]
+    d.text((cx-w//2,y),text,font=font,fill=color)
+
+def wrap_text(d, text, font, max_w):
+    words=text.split(); lines=[]; line=[]
+    for w in words:
+        test=" ".join(line+[w])
+        if d.textbbox((0,0),test,font=font)[2]>max_w:
+            if line: lines.append(" ".join(line))
+            line=[w]
+        else: line.append(w)
+    if line: lines.append(" ".join(line))
+    return lines
+
+def draw_pitch(d, S, top_h):
+    stripe_w=54
+    for x in range(0,S,stripe_w*2):
+        d.rectangle([x,0,min(x+stripe_w,S),top_h],fill=PITCH_DARK)
+        d.rectangle([min(x+stripe_w,S),0,min(x+stripe_w*2,S),top_h],fill=PITCH_MID)
+    for i in range(22):
+        d.rectangle([i,i,S-i,top_h-i],outline=(0,0,0,int(80*(1-i/22))),width=1)
+    cxp,cyp,r=S//2,int(top_h*0.52),175
+    for t in range(3):
+        d.ellipse([cxp-r+t,cyp-r+t,cxp+r-t,cyp+r-t],outline=(255,255,255,25),width=1)
+    d.ellipse([cxp-4,cyp-4,cxp+4,cyp+4],fill=(255,255,255,40))
+    d.rectangle([0,top_h//2,S,top_h//2+1],fill=(255,255,255,20))
+
+# ── Football Data API ─────────────────────────────────────────────────────────
+def fd_get(path):
+    r = requests.get(
+        f"https://api.football-data.org/v4{path}",
+        headers={"X-Auth-Token": FD_KEY},
+        timeout=15
+    )
+    r.raise_for_status()
+    return r.json()
+
+def get_todays_matches():
+    now = datetime.now(timezone.utc)
+    date_str = now.strftime("%Y-%m-%d")
+    data = fd_get(f"/competitions/WC/matches?dateFrom={date_str}&dateTo={date_str}")
+    return data.get("matches", [])
+
+def get_finished_matches():
+    matches = get_todays_matches()
+    return [m for m in matches if m["status"] == "FINISHED"]
+
+def format_kickoff_et(utc_str):
+    """Convert UTC ISO string to ET time string."""
+    dt = datetime.fromisoformat(utc_str.replace("Z","+00:00"))
+    et = dt - timedelta(hours=4)  # EDT (UTC-4, summer)
+    hour = et.hour % 12 or 12
+    ampm = "AM" if et.hour < 12 else "PM"
+    return f"{hour}:{et.strftime('%M')} {ampm} ET"
+
+def match_stage_label(match):
+    stage = match.get("stage","").replace("_"," ").title()
+    group = match.get("group","")
+    if group:
+        g = group.replace("GROUP_","Group ")
+        return f"{stage} · {g}"
+    return stage
+
+def day_number():
+    delta = datetime.now(timezone.utc) - TOURNAMENT_START
+    return max(1, delta.days + 1)
+
+# ── Claude API ────────────────────────────────────────────────────────────────
+def claude_insight(home, away, home_score, away_score, stage):
+    """Generate a punchy 1-line match insight."""
+    prompt = (
+        f"Write ONE punchy sentence (max 18 words) as a match insight for an Instagram post. "
+        f"Match: {home} {home_score}–{away_score} {away}. Stage: {stage}. "
+        f"Sound like a sharp sports journalist, not a bot. No quotes, no hashtags, just the line."
+    )
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={"Content-Type":"application/json","x-api-key":CLAUDE_KEY,
+                 "anthropic-version":"2023-06-01"},
+        json={"model":"claude-sonnet-4-6","max_tokens":80,
+              "messages":[{"role":"user","content":prompt}]},
+        timeout=20
+    )
+    r.raise_for_status()
+    return r.json()["content"][0]["text"].strip().strip('"')
+
+def claude_caption(home, away, home_score, away_score, stage, insight):
+    """Generate a full Instagram caption with hashtags."""
+    prompt = (
+        f"Write an Instagram caption for a World Cup result post. "
+        f"Match: {home} {home_score}–{away_score} {away}. Stage: {stage}. "
+        f"Key insight: {insight}\n\n"
+        f"Format: 2-3 punchy lines, then a blank line, then 15 relevant hashtags. "
+        f"Tone: sharp, knowledgeable, engaging. No emoji overload — max 3 total."
+    )
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={"Content-Type":"application/json","x-api-key":CLAUDE_KEY,
+                 "anthropic-version":"2023-06-01"},
+        json={"model":"claude-sonnet-4-6","max_tokens":300,
+              "messages":[{"role":"user","content":prompt}]},
+        timeout=20
+    )
+    r.raise_for_status()
+    return r.json()["content"][0]["text"].strip()
+
+def claude_schedule_caption(matches, date_str):
+    """Generate caption for the morning schedule post."""
+    match_list = "\n".join([f"- {m['home']} vs {m['away']} ({m['time']})" for m in matches])
+    prompt = (
+        f"Write an Instagram caption for a World Cup daily schedule post. "
+        f"Date: {date_str}. Matches today:\n{match_list}\n\n"
+        f"Format: 1 hype opener line, then list the 2-3 most exciting matchups with one word each, "
+        f"then a blank line, then 12 relevant hashtags. Keep it under 150 words total."
+    )
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={"Content-Type":"application/json","x-api-key":CLAUDE_KEY,
+                 "anthropic-version":"2023-06-01"},
+        json={"model":"claude-sonnet-4-6","max_tokens":250,
+              "messages":[{"role":"user","content":prompt}]},
+        timeout=20
+    )
+    r.raise_for_status()
+    return r.json()["content"][0]["text"].strip()
+
+# ── Graphic generators (self-contained, no external imports) ──────────────────
+def make_result_card(home, away, home_score, away_score, stage, venue, insight, date_str, output_path):
+    S=1080; SPLIT=555; WHITE=(255,255,255); INK=(12,12,22)
+    img=Image.new("RGB",(S,S),"#FFFFFF"); d=ImageDraw.Draw(img)
+    won = home if home_score>away_score else (away if away_score>home_score else None)
+    ax=get_accent(won) if won else "#1a5c2a"; ac=hr(ax); adk=darken(ax,0.62)
+    draw_pitch(d,S,SPLIT)
+    d.rectangle([0,SPLIT,S,S],fill=(252,252,252))
+    d.rectangle([0,SPLIT,S,SPLIT+8],fill=ac)
+    f_stg=lf(POPPINS_B,26); f_tm=lf(BEBAS,96); f_sc=lf(BEBAS,260)
+    f_bdg=lf(POPPINS_B,29); f_ins=lf(POPPINS_B,37)
+    f_sv=lf(BEBAS,48); f_sl=lf(POPPINS_M,20)
+    f_ven=lf(POPPINS_R,23); f_br=lf(POPPINS_B,21)
+    centered(d,stage.upper(),f_stg,28,S,(205,230,205))
+    if   home_score>away_score: badge=f"{home.upper()} WIN"
+    elif away_score>home_score: badge=f"{away.upper()} WIN"
+    else:                        badge="DRAW"
+    bb=d.textbbox((0,0),badge,font=f_bdg); bw=bb[2]-bb[0]+44
+    bx=(S-bw)//2
+    d.rounded_rectangle([bx,68,bx+bw,112],radius=7,fill=ac)
+    centered(d,badge,f_bdg,76,S,WHITE)
+    HL,HR=S//4,S*3//4; ty=130
+    for name,ccx in [(home.upper(),HL),(away.upper(),HR)]:
+        nbb=d.textbbox((0,0),name,font=f_tm); nw=nbb[2]-nbb[0]
+        d.text((ccx-nw//2+3,ty+3),name,font=f_tm,fill=(0,0,0,90))
+        d.text((ccx-nw//2,ty),name,font=f_tm,fill=WHITE)
+    for ccx in [HL,HR]:
+        d.rectangle([ccx-26,ty+98,ccx+26,ty+103],fill=ac)
+    sc=f"{home_score}  –  {away_score}"
+    scbb=d.textbbox((0,0),sc,font=f_sc); scw=scbb[2]-scbb[0]; scx=(S-scw)//2
+    scy=int(SPLIT*0.52)-(scbb[3]-scbb[1])//2+20
+    d.text((scx+5,scy+5),sc,font=f_sc,fill=(0,0,0,100))
+    d.text((scx,scy),sc,font=f_sc,fill=WHITE)
+    lines=wrap_text(d,insight,f_ins,S-100); iy=SPLIT+28
+    for i,ln in enumerate(lines[:3]):
+        centered(d,ln,f_ins,iy+i*52,S,INK)
+    iy_end=iy+len(lines[:3])*52
+    d.rectangle([0,S-62,S,S],fill=PITCH_DARK)
+    d.rectangle([0,S-62,S,S-58],fill=PITCH_EDGE)
+    centered(d,"WORLD CUP IN 5  ·  2026",f_br,S-44,S,WHITE)
+    Path(output_path).parent.mkdir(parents=True,exist_ok=True)
+    img.save(output_path,"PNG")
+    return output_path
+
+def make_schedule_card(matches, date_str, day_num, output_path):
+    S=1080; img=Image.new("RGB",(S,S),"#FFFFFF"); d=ImageDraw.Draw(img)
+    NAVY=(10,18,45); GOLD=(212,168,75); GOLD_LT=(240,215,140); GOLD_DK=(160,122,40)
+    OFF_W=(252,250,245); MID=(28,42,80); MUTED=(120,130,155); WHITE=(255,255,255)
+    HH=292
+    d.rectangle([0,0,S,HH],fill=NAVY)
+    for i in range(0,80,8): d.line([(0,180+i),(120+i,60)],fill=(30,48,100),width=1)
+    d.rectangle([0,HH,S,HH+10],fill=GOLD)
+    d.rectangle([0,HH+10,S,S],fill=OFF_W)
+    f_ey=lf(POPPINS_B,22); f_dy=lf(BEBAS,130); f_dt=lf(POPPINS_B,32)
+    f_sh=lf(POPPINS_M,22); f_br=lf(POPPINS_B,20)
+    centered(d,"2026 FIFA WORLD CUP  ·  TODAY'S MATCHES",f_ey,28,S,GOLD)
+    centered(d,f"DAY {day_num}",f_dy,52,S,WHITE)
+    centered(d,date_str.upper(),f_dt,186,S,GOLD_LT)
+    mc=f"{len(matches)} MATCH{'ES' if len(matches)!=1 else ''} TODAY"
+    mcbb=d.textbbox((0,0),mc,font=f_sh); mcw=mcbb[2]-mcbb[0]+38; mcx=(S-mcw)//2
+    d.rounded_rectangle([mcx,234,mcx+mcw,274],radius=6,fill=MID)
+    centered(d,mc,f_sh,240,S,GOLD_LT)
+    n=len(matches); pad_x=48; FOOTER=62
+    body_top=HH+10; body_bot=S-FOOTER
+    row_h=(body_bot-body_top-20)//n; start_y=body_top+10
+    if row_h>=180:   tf=lf(BEBAS,80);  tif=lf(POPPINS_B,30); gf=lf(POPPINS_M,23)
+    elif row_h>=130: tf=lf(BEBAS,64);  tif=lf(POPPINS_B,26); gf=lf(POPPINS_M,20)
+    elif row_h>=100: tf=lf(BEBAS,52);  tif=lf(POPPINS_B,22); gf=lf(POPPINS_M,17)
+    else:            tf=lf(BEBAS,44);  tif=lf(POPPINS_B,18); gf=lf(POPPINS_M,15)
+    for i,m in enumerate(matches):
+        y=start_y+i*row_h; ym=y+row_h//2
+        d.rectangle([pad_x,y+4,S-pad_x,y+row_h-4],fill=(244,242,238) if i%2==0 else WHITE)
+        d.rectangle([pad_x,y+4,pad_x+5,y+row_h-4],fill=GOLD)
+        tb=d.textbbox((0,0),m["time"],font=tif); th=tb[3]-tb[1]
+        d.text((pad_x+18,ym-th//2-8),m["time"],font=tif,fill=NAVY)
+        if m.get("group"): d.text((pad_x+18,ym+6),m["group"],font=gf,fill=MUTED)
+        tc=(pad_x+190+(S-pad_x))//2
+        hu=m["home"].upper(); au=m["away"].upper()
+        hb=d.textbbox((0,0),hu,font=tf); hw=hb[2]-hb[0]
+        ab=d.textbbox((0,0),au,font=tf); aw=ab[2]-ab[0]
+        vb=d.textbbox((0,0),"vs",font=gf); vw=vb[2]-vb[0]
+        g2=16; tw=hw+g2+vw+g2+aw; tx=tc-tw//2; ty2=ym-(hb[3]-hb[1])//2-4
+        d.text((tx,ty2),hu,font=tf,fill=NAVY)
+        d.text((tx+hw+g2,ym-(vb[3]-vb[1])//2),"vs",font=gf,fill=MUTED)
+        d.text((tx+hw+g2+vw+g2,ty2),au,font=tf,fill=NAVY)
+        st=m.get("stage","").upper()
+        if st:
+            sb=d.textbbox((0,0),st,font=gf); sw=sb[2]-sb[0]
+            d.text((S-pad_x-sw-8,ym-(sb[3]-sb[1])//2),st,font=gf,fill=GOLD_DK)
+        if i<n-1: d.rectangle([pad_x+5,y+row_h-1,S-pad_x,y+row_h],fill=(220,218,212))
+    d.rectangle([0,S-FOOTER,S,S],fill=NAVY); d.rectangle([0,S-FOOTER,S,S-FOOTER+4],fill=GOLD_DK)
+    centered(d,"WORLD CUP IN 5  ·  2026  ·  ALL TIMES ET",f_br,S-42,S,WHITE)
+    Path(output_path).parent.mkdir(parents=True,exist_ok=True)
+    img.save(output_path,"PNG")
+    return output_path
+
+# ── Dropbox uploader ──────────────────────────────────────────────────────────
+def upload_to_dropbox(local_path, remote_filename):
+    dbx = dropbox.Dropbox(DBX_TOKEN)
+    remote_path = f"{DBX_FOLDER}/{remote_filename}"
+    with open(local_path, "rb") as f:
+        dbx.files_upload(f.read(), remote_path,
+                         mode=dropbox.files.WriteMode.overwrite)
+    log.info(f"Uploaded → Dropbox:{remote_path}")
+    return remote_path
+
+def save_caption(caption, remote_filename_base):
+    """Save caption as a .txt file alongside the graphic in Dropbox."""
+    txt_path = TMP_DIR / f"{remote_filename_base}.txt"
+    txt_path.write_text(caption, encoding="utf-8")
+    upload_to_dropbox(str(txt_path), f"{remote_filename_base}.txt")
+
+# ── State: track posted matches ───────────────────────────────────────────────
+def load_posted():
+    if POSTED_FILE.exists():
+        return set(json.loads(POSTED_FILE.read_text()))
+    return set()
+
+def save_posted(posted):
+    POSTED_FILE.write_text(json.dumps(list(posted)))
+
+def already_posted_schedule_today():
+    marker = TMP_DIR / f"sched_{datetime.now(timezone.utc).strftime('%Y%m%d')}.done"
+    return marker.exists()
+
+def mark_schedule_posted():
+    marker = TMP_DIR / f"sched_{datetime.now(timezone.utc).strftime('%Y%m%d')}.done"
+    marker.touch()
+
+# ── Core jobs ─────────────────────────────────────────────────────────────────
+def job_result_cards():
+    """Check for newly finished matches and post result cards."""
+    try:
+        posted = load_posted()
+        finished = get_finished_matches()
+        new = [m for m in finished if str(m["id"]) not in posted]
+
+        if not new:
+            log.info(f"Poll: {len(finished)} finished, 0 new")
+            return
+
+        for match in new:
+            mid   = str(match["id"])
+            home  = match["homeTeam"]["name"]
+            away  = match["awayTeam"]["name"]
+            hs    = match["score"]["fullTime"]["home"]
+            as_   = match["score"]["fullTime"]["away"]
+            stage = match_stage_label(match)
+            venue = match.get("venue","") or ""
+            today = datetime.now(timezone.utc).strftime("%B %-d, %Y")
+
+            log.info(f"New result: {home} {hs}–{as_} {away}")
+
+            # Get AI insight
+            insight = claude_insight(home, away, hs, as_, stage)
+            log.info(f"Insight: {insight}")
+
+            # Get full caption
+            caption = claude_caption(home, away, hs, as_, stage, insight)
+
+            # Generate graphic
+            safe_name = f"{home.replace(' ','_')}_vs_{away.replace(' ','_')}_{mid}"
+            img_path  = str(TMP_DIR / f"{safe_name}.png")
+            make_result_card(home, away, hs, as_, stage, venue, insight, today, img_path)
+
+            # Upload graphic + caption
+            upload_to_dropbox(img_path, f"{safe_name}.png")
+            save_caption(caption, safe_name)
+
+            posted.add(mid)
+            save_posted(posted)
+            log.info(f"Posted: {safe_name}")
+
+    except Exception as e:
+        log.error(f"Result job error: {e}", exc_info=True)
+
+
+def job_schedule_card():
+    """Post the morning schedule card at 8am ET."""
+    try:
+        if already_posted_schedule_today():
+            return
+
+        matches_raw = get_todays_matches()
+        if not matches_raw:
+            log.info("Schedule job: no matches today, skipping")
+            mark_schedule_posted()
+            return
+
+        today_et = datetime.now(timezone(timedelta(hours=-4)))
+        date_str  = today_et.strftime("%A, %B %-d")
+        dn        = day_number()
+
+        matches = []
+        for m in sorted(matches_raw, key=lambda x: x["utcDate"]):
+            group = m.get("group","") or ""
+            if group: group = group.replace("GROUP_","Group ")
+            stage = m.get("stage","").replace("_"," ").title()
+            matches.append({
+                "time":  format_kickoff_et(m["utcDate"]),
+                "home":  m["homeTeam"]["name"],
+                "away":  m["awayTeam"]["name"],
+                "group": group,
+                "stage": stage,
+            })
+
+        log.info(f"Schedule: Day {dn} · {date_str} · {len(matches)} matches")
+
+        img_path = str(TMP_DIR / f"schedule_{today_et.strftime('%Y%m%d')}.png")
+        make_schedule_card(matches, date_str, dn, img_path)
+
+        caption = claude_schedule_caption(matches, date_str)
+
+        fname_base = f"SCHEDULE_{today_et.strftime('%Y%m%d')}_Day{dn}"
+        upload_to_dropbox(img_path, f"{fname_base}.png")
+        save_caption(caption, fname_base)
+        mark_schedule_posted()
+
+        log.info(f"Schedule card posted for {date_str}")
+
+    except Exception as e:
+        log.error(f"Schedule job error: {e}", exc_info=True)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+def main():
+    log.info("World Cup in 5 — Poller starting")
+    download_fonts()
+
+    # Schedule: result cards every 3 minutes
+    schedule.every(3).minutes.do(job_result_cards)
+
+    # Schedule: daily schedule card at 8:00 AM ET
+    # Render runs UTC — 8am ET (EDT) = 12:00 UTC
+    schedule.every().day.at("12:00").do(job_schedule_card)
+
+    # Run both immediately on startup
+    log.info("Running initial jobs...")
+    job_schedule_card()
+    job_result_cards()
+
+    log.info("Poller running. Ctrl+C to stop.")
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
+
+
+if __name__ == "__main__":
+    main()
