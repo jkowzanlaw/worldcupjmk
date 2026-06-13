@@ -180,8 +180,20 @@ def fd_get(path):
     return r.json()
 
 def get_todays_matches():
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return fd_get(f"/competitions/WC/matches?dateFrom={date_str}&dateTo={date_str}").get("matches", [])
+    """Fetch all matches for today in ET — spans UTC midnight for late games."""
+    et_now = datetime.now(timezone(timedelta(hours=-4)))
+    et_date = et_now.strftime("%Y-%m-%d")
+    # Also fetch next UTC day to catch late ET games (e.g. 9pm ET = 01:00 UTC next day)
+    et_tomorrow = (et_now + timedelta(days=1)).strftime("%Y-%m-%d")
+    matches = fd_get(f"/competitions/WC/matches?dateFrom={et_date}&dateTo={et_tomorrow}").get("matches", [])
+    # Filter to only matches whose ET date matches today
+    today_matches = []
+    for m in matches:
+        utc_dt = datetime.fromisoformat(m["utcDate"].replace("Z","+00:00"))
+        et_dt = utc_dt - timedelta(hours=4)
+        if et_dt.strftime("%Y-%m-%d") == et_date:
+            today_matches.append(m)
+    return today_matches
 
 def format_kickoff_et(utc_str):
     """Convert UTC kickoff time to US Eastern Time (EDT = UTC-4)."""
