@@ -536,6 +536,11 @@ def make_schedule_card(matches,date_str,day_num,output_path):
     return safe_save(img, output_path)
 
 # ── Core jobs ─────────────────────────────────────────────────────────────────
+def job_result_and_recap():
+    """Run result cards then check if recap should fire."""
+    job_result_cards()
+    job_recap_card()  # Will self-gate — only runs when all games finished
+
 def job_result_cards():
     try:
         posted = load_posted()
@@ -789,7 +794,7 @@ def mark_recap_done():
 
 
 def job_recap_card():
-    """Generate end-of-day recap card at midnight ET (04:00 UTC)."""
+    """Generate end-of-day recap card — only after ALL of today's matches are finished."""
     try:
         if recap_done_today(): return
 
@@ -797,11 +802,25 @@ def job_recap_card():
         date_str  = today_et.strftime("%A, %B %-d")
         dn        = day_number()
 
-        # Get today's finished matches
-        finished = [m for m in get_todays_matches() if m["status"] == "FINISHED"]
-        if not finished:
-            log.info("Recap job: no finished matches today, skipping")
+        # Get ALL of today's matches
+        all_today = get_todays_matches()
+        if not all_today:
+            log.info("Recap job: no matches today, skipping")
             mark_recap_done(); return
+
+        finished = [m for m in all_today if m["status"] in ("FINISHED","FULL_TIME")]
+        pending  = [m for m in all_today if m["status"] not in ("FINISHED","FULL_TIME")]
+
+        if not finished:
+            log.info("Recap job: no finished matches yet, skipping")
+            return
+
+        if pending:
+            pending_names = [f"{m['homeTeam']['name']} vs {m['awayTeam']['name']}" for m in pending]
+            log.info(f"Recap job: {len(pending)} matches still in progress — waiting: {pending_names}")
+            return
+
+        log.info(f"Recap job: all {len(finished)} matches finished — generating recap")
 
         # Build results list
         results = []
@@ -886,7 +905,7 @@ def job_recap_card():
 def main():
     log.info("World Cup in 5 — Poller v2 starting")
     download_fonts()
-    schedule.every(5).minutes.do(job_result_cards)  # 5 min = 12 calls/hr, safe for free tier
+    schedule.every(5).minutes.do(job_result_and_recap)  # 5 min = 12 calls/hr, safe for free tier
     schedule.every().day.at("12:00").do(job_schedule_card)  # 8am ET = 12:00 UTC
     schedule.every().day.at("04:00").do(job_recap_card)     # midnight ET = 04:00 UTC
     # ── API health check on startup ───────────────────────────────────────────
@@ -908,8 +927,14 @@ def main():
         log.info("Reset schedule done marker — will regenerate")
     job_schedule_card()
     job_result_cards()
-    # Run recap if not already done today (catches restarts after midnight)
-    job_recap_card()
+    # Only run recap on startup if it's after midnight ET (all games finished)
+    # This prevents recap from running mid-day when games are still pending
+    hour_et = et_now().hour
+    if hour_et >= 0 and hour_et < 6:  # midnight to 6am ET only
+        log.info("Post-midnight startup — checking if recap needed")
+        job_recap_card()
+    else:
+        log.info("Skipping recap on startup — not yet midnight ET")
     log.info("Poller running.")
     while True:
         schedule.run_pending()
