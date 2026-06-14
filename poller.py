@@ -867,7 +867,7 @@ def job_recap_card():
 
         # Generate card
         img_path = str(TMP_DIR / f"recap_{et_today().replace('-','')}.png")
-        make_recap_card(dn, date_str, results, standings, scorers_card, stat_hero, img_path)
+        img_path = make_recap_card(dn, date_str, results, standings, scorers_card, stat_hero, img_path)
 
         # Build full caption with hashtags
         hashtags = build_hashtag_block("","","group stage")
