@@ -537,9 +537,10 @@ def make_schedule_card(matches,date_str,day_num,output_path):
 
 # ── Core jobs ─────────────────────────────────────────────────────────────────
 def job_result_and_recap():
-    """Run result cards then check if recap should fire."""
+    """Run result cards, then recap + tomorrow content when all games done."""
     job_result_cards()
-    job_recap_card()  # Will self-gate — only runs when all games finished
+    job_recap_card()        # self-gates until all games finished
+    job_tomorrow_content()  # self-gates until recap done
 
 def job_result_cards():
     try:
@@ -900,6 +901,187 @@ def job_recap_card():
 
     except Exception as e:
         log.error(f"Recap job error: {e}", exc_info=True)
+
+# ── Tomorrow's content generator ─────────────────────────────────────────────
+def tomorrow_done():
+    tomorrow = (et_now() + timedelta(days=1)).strftime("%Y%m%d")
+    return (TMP_DIR / f"tomorrow_{tomorrow}.done").exists()
+
+def mark_tomorrow_done():
+    tomorrow = (et_now() + timedelta(days=1)).strftime("%Y%m%d")
+    (TMP_DIR / f"tomorrow_{tomorrow}.done").touch()
+
+def claude_prediction(home, away, group, kickoff):
+    """Ask Claude for a match prediction — returns dict or None."""
+    fmt = ('{"pred_home":0,"pred_away":0,"confidence":"HIGH",'
+           '"key_player":"","key_player_team":"",'
+           '"reason":"one sentence max 20 words",'
+           '"caption":"punchy 80-word Instagram caption ending with follow @worldcupin5"}')
+    prompt = (
+        "Generate a World Cup 2026 AI match prediction for "
+        + home + " vs " + away
+        + ". Group: " + group + ", Kickoff: " + kickoff
+        + "\n\nRespond in EXACT JSON, no markdown:\n" + fmt
+    )
+    result = claude_call(prompt, max_tokens=300)
+    if not result:
+        return None
+    try:
+        clean = result.strip().lstrip("`").rstrip("`")
+        if clean.startswith("json"): clean = clean[4:]
+        return json.loads(clean)
+    except Exception as e:
+        log.error(f"Prediction JSON parse error: {e}")
+        return None
+
+def make_pred_card(home, away, group, venue, kickoff,
+                   ph, pa, kp, kp_team, reason, conf, output_path):
+    """Cyberpunk neon AI prediction card."""
+    from PIL import ImageFilter
+    S=1080
+    img=Image.new("RGB",(S,S),(4,4,14)); d=ImageDraw.Draw(img)
+    CY=(0,255,200); MG=(255,0,180); YL=(255,230,0)
+    GR=(0,255,100); WH=(255,255,255); OR=(255,150,0)
+    CC={"LOW":MG,"MEDIUM":OR,"HIGH":GR}.get(conf,OR)
+
+    def gt(p,s):
+        try: return ImageFont.truetype(p,s)
+        except: return ImageFont.load_default()
+
+    def glow(im,text,font,y,col,gc,centre=True,x=0):
+        W=im.width
+        gl=Image.new("RGBA",(im.width,im.height),(0,0,0,0))
+        gd=ImageDraw.Draw(gl)
+        bb=gd.textbbox((0,0),text,font=font); tw=bb[2]-bb[0]
+        tx=((W-tw)//2) if centre else x
+        for o in [8,5,3]: gd.text((tx,y-bb[1]),text,font=font,fill=(*gc,int(120/o*8)))
+        gl=gl.filter(ImageFilter.GaussianBlur(5))
+        im=im.convert("RGBA"); im.alpha_composite(gl); im=im.convert("RGB")
+        ImageDraw.Draw(im).text((tx,y-bb[1]),text,font=font,fill=col)
+        return im
+
+    def gbox(im,x0,y0,x1,y1,col,w=2):
+        gl=Image.new("RGBA",(im.width,im.height),(0,0,0,0))
+        gd=ImageDraw.Draw(gl)
+        for o in range(10,0,-2): gd.rectangle([x0-o,y0-o,x1+o,y1+o],outline=(*col,int(140/o*10)),width=1)
+        gl=gl.filter(ImageFilter.GaussianBlur(4))
+        im=im.convert("RGBA"); im.alpha_composite(gl); im=im.convert("RGB")
+        ImageDraw.Draw(im).rectangle([x0,y0,x1,y1],outline=col,width=w)
+        return im
+
+    for x in range(0,S,54): d.line([(x,0),(x,S)],fill=(0,50,35),width=1)
+    for y in range(0,S,54): d.line([(0,y),(S,y)],fill=(0,50,35),width=1)
+    for y in range(0,S,3): d.rectangle([0,y,S,y+1],fill=(0,0,0,25))
+    for r in range(480,0,-5):
+        t=r/480; d.ellipse([S//2-r,S//2-r,S//2+r,S//2+r],fill=(0,int(35*(1-t)),int(18*(1-t))))
+
+    d.rectangle([0,0,S,68],fill=(6,6,22)); d.rectangle([0,66,S,70],fill=CY)
+    img=glow(img,"2026 FIFA WORLD CUP  ·  AI MATCH PREDICTION",gt(POPPINS_B,19),16,CY,CY)
+    img=glow(img,group.upper()+"  //  "+kickoff,gt(BEBAS,36),38,YL,YL)
+    bw=280; by=78; bx=(S-bw)//2
+    d=ImageDraw.Draw(img); d.rectangle([bx,by,bx+bw,by+42],fill=(8,4,24))
+    img=gbox(img,bx,by,bx+bw,by+42,MG,2)
+    img=glow(img,"◀  AI PREDICTED  ▶",gt(BEBAS,30),by+8,MG,MG)
+    ty=132
+    for name,ccx_,col in [(home.upper(),S//4,CY),(away.upper(),S*3//4,MG)]:
+        fu=gt(BEBAS,114); d=ImageDraw.Draw(img)
+        nb=d.textbbox((0,0),name,font=fu); nw=nb[2]-nb[0]
+        while nw>S//2-20 and fu.size>48:
+            fu=gt(BEBAS,fu.size-6)
+            nb=d.textbbox((0,0),name,font=fu); nw=nb[2]-nb[0]
+        img=glow(img,name,fu,ty,col,col,centre=False,x=ccx_-nw//2)
+        d=ImageDraw.Draw(img); nh=nb[3]-nb[1]
+        d.rectangle([ccx_-40,ty+nh+2,ccx_+40,ty+nh+6],fill=col)
+    img=glow(img,"VS",gt(POPPINS_B,30),ty+46,(80,80,80),(40,40,40))
+    sc_y=300; sc_h=186; d=ImageDraw.Draw(img)
+    d.rectangle([44,sc_y,S-44,sc_y+sc_h],fill=(6,8,26))
+    img=gbox(img,44,sc_y,S-44,sc_y+sc_h,YL,2)
+    img=glow(img,"PREDICTED  SCORE",gt(POPPINS_B,20),sc_y+10,YL,YL)
+    fsc=gt(BEBAS,140); sc=str(ph)+"  -  "+str(pa); d=ImageDraw.Draw(img)
+    scb=d.textbbox((0,0),sc,font=fsc); scw=scb[2]-scb[0]
+    img=glow(img,sc,fsc,sc_y+42,WH,YL,centre=False,x=(S-scw)//2)
+    cw=340; cy2=sc_y+sc_h+8; cx2=(S-cw)//2; d=ImageDraw.Draw(img)
+    d.rectangle([cx2,cy2,cx2+cw,cy2+52],fill=(6,8,26))
+    img=gbox(img,cx2,cy2,cx2+cw,cy2+52,CC,2)
+    img=glow(img,"CONFIDENCE :  "+conf,gt(BEBAS,38),cy2+10,CC,CC)
+    kp_y=cy2+66; kp_h=112; d=ImageDraw.Draw(img)
+    d.rectangle([44,kp_y,S-44,kp_y+kp_h],fill=(6,8,26))
+    img=gbox(img,44,kp_y,S-44,kp_y+kp_h,GR,2)
+    img=glow(img,"◉  KEY PLAYER  TO  WATCH",gt(POPPINS_B,17),kp_y+10,GR,GR)
+    img=glow(img,kp.upper(),gt(BEBAS,66),kp_y+32,WH,GR)
+    img=glow(img,kp_team.upper(),gt(POPPINS_B,20),kp_y+86,GR,GR)
+    wr_y=kp_y+kp_h+16
+    img=glow(img,"WHY  WE  THINK  SO",gt(POPPINS_B,18),wr_y,CY,CY)
+    wr_y+=28; d=ImageDraw.Draw(img); fr=gt(POPPINS_B,27)
+    words=reason.split(); lines=[]; line=[]
+    for w in words:
+        if d.textbbox((0,0)," ".join(line+[w]),font=fr)[2]>S-80:
+            if line: lines.append(" ".join(line))
+            line=[w]
+        else: line.append(w)
+    if line: lines.append(" ".join(line))
+    for i,ln in enumerate(lines[:3]): img=glow(img,ln,fr,wr_y+i*40,WH,(50,50,50))
+    wr_y+=len(lines[:3])*40+10
+    img=glow(img,venue.upper(),gt(POPPINS_M,17),wr_y+10,(0,200,140),(0,80,60))
+    d=ImageDraw.Draw(img)
+    d.rectangle([0,S-52,S,S],fill=(4,4,14)); d.rectangle([0,S-52,S,S-49],fill=CY)
+    img=glow(img,"WORLD CUP IN 5  ·  2026  ·  @WORLDCUPIN5",gt(POPPINS_B,19),S-36,CY,CY)
+    return safe_save(img, output_path)
+
+def job_tomorrow_content():
+    """Generate tomorrow schedule + AI predictions — only after recap is done."""
+    try:
+        if tomorrow_done(): return
+        if not recap_done_today():
+            log.debug("Tomorrow content waiting for recap to complete first")
+            return
+        tomorrow_et = et_now() + timedelta(days=1)
+        tomorrow_str = tomorrow_et.strftime("%Y-%m-%d")
+        date_str = tomorrow_et.strftime("%A, %B %-d")
+        dn = day_number() + 1
+        matches_raw = get_matches_for_et_date(tomorrow_str)
+        if not matches_raw:
+            log.info("No matches tomorrow — skipping tomorrow content")
+            mark_tomorrow_done(); return
+        log.info("Generating tomorrow content: " + str(len(matches_raw)) + " matches on " + date_str)
+        # Schedule card
+        matches = []
+        for m in sorted(matches_raw, key=lambda x: x["utcDate"]):
+            group = (m.get("group","") or "").replace("GROUP_","Group ")
+            matches.append({"time":format_kickoff_et(m["utcDate"]),"home":m["homeTeam"]["name"],
+                            "away":m["awayTeam"]["name"],"group":group})
+        sched_path = str(TMP_DIR / ("schedule_"+tomorrow_str.replace("-","")+".png"))
+        sched_path = make_schedule_card(matches, date_str, dn, sched_path)
+        sched_caption = claude_schedule_caption(matches, date_str, dn, build_hashtag_block("","","group stage"))
+        upload_dropbox(sched_path, Path(sched_path).name)
+        save_caption_file(sched_caption, Path(sched_path).stem)
+        log.info("Tomorrow schedule uploaded: " + Path(sched_path).name)
+        # Prediction cards
+        for m in sorted(matches_raw, key=lambda x: x["utcDate"]):
+            home = m["homeTeam"]["name"]; away = m["awayTeam"]["name"]
+            group = (m.get("group","") or "").replace("GROUP_","Group ")
+            kickoff = format_kickoff_et(m["utcDate"])
+            venue = m.get("venue","") or ""
+            pred = claude_prediction(home, away, group, kickoff)
+            if not pred:
+                log.warning("No prediction for " + home + " vs " + away); continue
+            safe = "PRED_"+home.replace(" ","_")+"_vs_"+away.replace(" ","_")+"_"+tomorrow_str.replace("-","")
+            pred_path = str(TMP_DIR / (safe+".png"))
+            pred_path = make_pred_card(
+                home, away, group, venue, kickoff,
+                pred["pred_home"], pred["pred_away"],
+                pred["key_player"], pred["key_player_team"],
+                pred["reason"], pred["confidence"], pred_path
+            )
+            caption = pred["caption"] + "\n\n" + build_hashtag_block(home, away, "group stage")
+            upload_dropbox(pred_path, Path(pred_path).name)
+            save_caption_file(caption, Path(pred_path).stem)
+            log.info("Tomorrow prediction uploaded: " + home + " vs " + away)
+            time.sleep(3)
+        mark_tomorrow_done()
+        log.info("Tomorrow content complete: " + date_str)
+    except Exception as e:
+        log.error(f"Tomorrow content job error: {e}", exc_info=True)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
