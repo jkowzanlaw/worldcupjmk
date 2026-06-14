@@ -173,32 +173,65 @@ def claude_schedule_caption(matches, date_str, day_num, hashtags):
     return result
 
 # ── Football Data API ─────────────────────────────────────────────────────────
-def fd_get(path, retries=3):
-    """Fetch from football-data.org with rate-limit handling and retries."""
+_api_cache = {}  # {path: (timestamp, data)}
+_last_api_call = 0
+API_MIN_INTERVAL = 7  # minimum seconds between any two API calls (safe under 10/min)
+
+def fd_get(path, retries=3, cache_secs=90):
+    """Fetch from football-data.org with caching, rate-limiting and retries.
+    cache_secs=90 means same endpoint reused within 90s won't hit API again."""
+    global _last_api_call
+
+    # Return cached response if fresh enough
+    if path in _api_cache:
+        cached_at, cached_data = _api_cache[path]
+        age = time.time() - cached_at
+        if age < cache_secs:
+            log.debug(f"API cache hit: {path} ({age:.0f}s old)")
+            return cached_data
+
+    # Enforce minimum interval between calls to avoid burst detection
+    since_last = time.time() - _last_api_call
+    if since_last < API_MIN_INTERVAL:
+        sleep_for = API_MIN_INTERVAL - since_last
+        log.debug(f"API throttle: sleeping {sleep_for:.1f}s")
+        time.sleep(sleep_for)
+
     for attempt in range(retries):
         try:
+            _last_api_call = time.time()
             r = requests.get(
                 f"https://api.football-data.org/v4{path}",
-                headers={"X-Auth-Token": FD_KEY}, timeout=15
+                headers={"X-Auth-Token": FD_KEY}, timeout=20
             )
             if r.status_code == 429:
-                wait = int(r.headers.get("X-RequestCounter-Reset", 60))
-                log.warning(f"Rate limited — waiting {wait}s before retry {attempt+1}/{retries}")
+                wait = int(r.headers.get("X-RequestCounter-Reset", 65))
+                log.warning(f"Rate limited — waiting {wait}s (attempt {attempt+1}/{retries})")
                 time.sleep(wait)
                 continue
-            if r.status_code == 403:
-                log.error(f"API forbidden — check plan limits: {path}")
+            if r.status_code in (403, 401):
+                log.error(f"API auth error {r.status_code}: {path} — check API key")
+                return {}
+            if r.status_code == 404:
+                log.warning(f"API 404: {path}")
                 return {}
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            _api_cache[path] = (time.time(), data)
+            return data
         except requests.exceptions.Timeout:
-            log.warning(f"API timeout on attempt {attempt+1}: {path}")
-            time.sleep(10)
+            log.warning(f"API timeout attempt {attempt+1}: {path}")
+            time.sleep(15)
         except Exception as e:
-            log.error(f"API error on attempt {attempt+1}: {e}")
-            time.sleep(5)
+            log.error(f"API error attempt {attempt+1}: {e}")
+            time.sleep(8)
+
     log.error(f"fd_get failed after {retries} attempts: {path}")
     return {}
+
+def fd_get_live(path, retries=3):
+    """For live match data — shorter cache (30s) to catch status changes faster."""
+    return fd_get(path, retries=retries, cache_secs=30)
 
 # ── ET timezone helper (EDT = UTC-4, fixed for World Cup duration June-July) ──
 ET = timezone(timedelta(hours=-4))
@@ -221,7 +254,7 @@ def get_matches_for_et_date(et_date_str):
     et_date = datetime.strptime(et_date_str, "%Y-%m-%d").replace(tzinfo=ET)
     utc_start = et_date_str
     utc_end = (et_date + timedelta(days=1)).strftime("%Y-%m-%d")
-    data = fd_get(f"/competitions/WC/matches?dateFrom={utc_start}&dateTo={utc_end}")
+    data = fd_get_live(f"/competitions/WC/matches?dateFrom={utc_start}&dateTo={utc_end}")
     matches = data.get("matches", [])
     result = []
     for m in matches:
@@ -841,6 +874,16 @@ def main():
     schedule.every(5).minutes.do(job_result_cards)  # 5 min = 12 calls/hr, safe for free tier
     schedule.every().day.at("12:00").do(job_schedule_card)  # 8am ET = 12:00 UTC
     schedule.every().day.at("04:00").do(job_recap_card)     # midnight ET = 04:00 UTC
+    # ── API health check on startup ───────────────────────────────────────────
+    log.info("Checking football-data.org API...")
+    try:
+        test = fd_get("/competitions/WC")
+        if test:
+            log.info(f"API OK — competition: {test.get('name','World Cup')}")
+        else:
+            log.error("API returned empty response — check API key or rate limit")
+    except Exception as e:
+        log.error(f"API health check failed: {e}")
     log.info("Running initial jobs...")
     job_schedule_card()
     job_result_cards()
