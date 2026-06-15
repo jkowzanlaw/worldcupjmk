@@ -309,15 +309,24 @@ def day_number():
 
 # ── Dropbox ───────────────────────────────────────────────────────────────────
 def upload_dropbox(local_path, filename):
+    p = Path(local_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Cannot upload — file not found: {local_path}")
+    size_kb = p.stat().st_size / 1024
+    if size_kb < 1:
+        raise ValueError(f"Cannot upload — file is {size_kb:.1f}KB (too small): {local_path}")
+    log.info(f"Uploading {filename} ({size_kb:.0f}KB) to Dropbox...")
+    data = p.read_bytes()  # read into memory first — avoids any path/rename race condition
+    if len(data) < 1024:
+        raise ValueError(f"Read {len(data)} bytes from {local_path} — aborting upload")
     dbx = dropbox.Dropbox(
         oauth2_refresh_token=DBX_TOKEN,
         app_key=os.environ.get("DROPBOX_APP_KEY","gmao4qdft812tm6"),
         app_secret=os.environ.get("DROPBOX_APP_SECRET","c0xopjcwq0ty2y7")
     )
     remote = f"{DBX_FOLDER}/{filename}"
-    with open(local_path,"rb") as f:
-        dbx.files_upload(f.read(), remote, mode=dropbox.files.WriteMode.overwrite)
-    log.info(f"Uploaded → Dropbox:{remote}")
+    dbx.files_upload(data, remote, mode=dropbox.files.WriteMode.overwrite)
+    log.info(f"Uploaded → Dropbox:{remote} ({size_kb:.0f}KB)")
 
 def save_caption_file(caption, base_name):
     p = TMP_DIR / f"{base_name}.txt"
