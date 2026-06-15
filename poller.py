@@ -571,15 +571,19 @@ def job_result_cards():
                    and m["score"]["fullTime"]["home"] is not None]
 
         # Also catch matches that just ended but API hasn't flipped to FINISHED yet
-        # If score exists and it's past expected end time, treat as finished
         just_ended = []
         for m in all_recent:
-            if m["status"] in ("IN_PLAY","PAUSED","EXTRA_TIME") and m["score"]["fullTime"]["home"] is not None:
-                kickoff_et = utc_to_et(m["utcDate"])
-                mins_since_kickoff = (et_now() - kickoff_et).total_seconds() / 60
-                if mins_since_kickoff > 110:  # 90 + 20 min buffer
-                    log.info(f"Treating {m['homeTeam']['name']} vs {m['awayTeam']['name']} as finished (status={m['status']} but {mins_since_kickoff:.0f} mins elapsed)")
-                    just_ended.append(m)
+            try:
+                if m["status"] in ("IN_PLAY","PAUSED","EXTRA_TIME"):
+                    ft = m.get("score",{}).get("fullTime",{})
+                    if ft.get("home") is not None:
+                        kickoff_et = utc_to_et(m["utcDate"])
+                        mins_since_kickoff = (et_now() - kickoff_et).total_seconds() / 60
+                        if mins_since_kickoff > 110:
+                            log.info(f"Treating {m['homeTeam']['name']} vs {m['awayTeam']['name']} as finished ({mins_since_kickoff:.0f} mins elapsed)")
+                            just_ended.append(m)
+            except Exception as e:
+                log.warning(f"just_ended check error for match {m.get('id','??')}: {e}")
 
         all_finished = finished + [m for m in just_ended if m not in finished]
         new = [m for m in all_finished if str(m["id"]) not in posted]
@@ -1181,8 +1185,17 @@ def main():
     else:
         log.info("Skipping recap on startup — not yet midnight ET")
     log.info("Poller running.")
+    consecutive_errors = 0
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+            consecutive_errors = 0
+        except Exception as e:
+            consecutive_errors += 1
+            log.error(f"Poll loop error #{consecutive_errors}: {e}", exc_info=True)
+            if consecutive_errors >= 10:
+                log.critical("Too many consecutive errors — restarting loop state")
+                consecutive_errors = 0
         time.sleep(30)
 
 if __name__ == "__main__":
