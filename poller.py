@@ -308,17 +308,18 @@ def day_number():
     return max(1, (today - start).days + 1)
 
 # ── Dropbox ───────────────────────────────────────────────────────────────────
-def upload_dropbox(local_path, filename):
+def upload_dropbox(local_path, filename, min_kb=0):
+    """Upload file to Dropbox. min_kb=0 for text files, min_kb=30 for images."""
     p = Path(local_path)
     if not p.exists():
         raise FileNotFoundError(f"Cannot upload — file not found: {local_path}")
     size_kb = p.stat().st_size / 1024
-    if size_kb < 1:
-        raise ValueError(f"Cannot upload — file is {size_kb:.1f}KB (too small): {local_path}")
-    log.info(f"Uploading {filename} ({size_kb:.0f}KB) to Dropbox...")
-    data = p.read_bytes()  # read into memory first — avoids any path/rename race condition
-    if len(data) < 1024:
-        raise ValueError(f"Read {len(data)} bytes from {local_path} — aborting upload")
+    is_image = filename.lower().endswith((".jpg",".jpeg",".png"))
+    if is_image and size_kb < 30:
+        raise ValueError(f"Image too small ({size_kb:.1f}KB) — aborting: {filename}")
+    if not is_image and size_kb == 0:
+        raise ValueError(f"Text file is empty — aborting: {filename}")
+    data = p.read_bytes()  # read into memory first
     dbx = dropbox.Dropbox(
         oauth2_refresh_token=DBX_TOKEN,
         app_key=os.environ.get("DROPBOX_APP_KEY","gmao4qdft812tm6"),
