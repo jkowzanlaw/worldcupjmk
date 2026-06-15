@@ -948,15 +948,15 @@ def job_recap_card():
         scorers_card = scorers_raw[:3] if scorers_raw else [
             {"name":"Golden Boot","team":"TBD","goals":0}]
 
-        # Generate card
-        img_path = str(TMP_DIR / f"{recap_key()}.png")
+        # Generate card — named by primary date (the actual game day, not midnight ET)
+        recap_fname = f"RECAP_{primary_str.replace('-','')}_Day{dn}"
+        img_path = str(TMP_DIR / f"{recap_fname}.png")
         img_path = make_recap_card(dn, date_str, results, standings, scorers_card, stat_hero, img_path)
 
         # Build full caption with hashtags
         hashtags = build_hashtag_block("","","group stage")
         full_caption = f"{caption_text}\n\n{hashtags}"
 
-        fname = f"RECAP_{today_et.strftime('%Y%m%d')}_Day{dn}"
         upload_dropbox(img_path, Path(img_path).name)
         save_caption_file(full_caption, Path(img_path).stem)
         mark_recap_done()
