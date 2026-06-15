@@ -250,18 +250,22 @@ def et_today():
     return et_now().strftime("%Y-%m-%d")
 
 def get_matches_for_et_date(et_date_str):
-    """Fetch all WC matches whose ET kickoff date = given ET date string YYYY-MM-DD."""
+    """Fetch all WC matches whose ET kickoff date = given ET date string YYYY-MM-DD.
+    Queries a wide UTC window (ET date -1 day to ET date +2 days) to catch all
+    matches regardless of UTC midnight crossover or API status update delays."""
     et_date = datetime.strptime(et_date_str, "%Y-%m-%d").replace(tzinfo=ET)
-    utc_start = et_date_str
-    utc_end = (et_date + timedelta(days=1)).strftime("%Y-%m-%d")
+    # Wide window: day before ET date in UTC to 2 days after — catches all edge cases
+    utc_start = (et_date - timedelta(days=1)).strftime("%Y-%m-%d")
+    utc_end   = (et_date + timedelta(days=2)).strftime("%Y-%m-%d")
     data = fd_get_live(f"/competitions/WC/matches?dateFrom={utc_start}&dateTo={utc_end}")
     matches = data.get("matches", [])
     result = []
     for m in matches:
+        # Filter by ET kickoff date — this is the authoritative date for our purposes
         m_et = utc_to_et(m["utcDate"])
         if m_et.strftime("%Y-%m-%d") == et_date_str:
             result.append(m)
-    log.debug(f"get_matches_for_et_date({et_date_str}): {len(result)} matches")
+    log.debug(f"get_matches_for_et_date({et_date_str}): {len(result)} matches from wide UTC window")
     return result
 
 def get_todays_matches():
@@ -269,16 +273,18 @@ def get_todays_matches():
     return get_matches_for_et_date(et_today())
 
 def get_recent_unposted_matches():
-    """Fetch finished matches from today AND yesterday ET that havent been posted yet.
-    Catches late games that finished after midnight or API delays."""
-    today = et_today()
+    """Fetch finished matches from today AND yesterday ET.
+    Wide UTC query window ensures late-night games finishing after midnight UTC
+    are always captured regardless of API update timing."""
+    today     = et_today()
     yesterday = (et_now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    matches = get_matches_for_et_date(today) + get_matches_for_et_date(yesterday)
+    matches   = get_matches_for_et_date(today) + get_matches_for_et_date(yesterday)
     # Deduplicate by match id
     seen = set(); unique = []
     for m in matches:
         if m["id"] not in seen:
             seen.add(m["id"]); unique.append(m)
+    log.debug(f"get_recent_unposted_matches: {len(unique)} unique matches (today+yesterday ET)")
     return unique
 
 def format_kickoff_et(utc_str):
@@ -563,10 +569,23 @@ def job_result_cards():
         finished = [m for m in all_recent
                    if m["status"] in ("FINISHED","FULL_TIME")
                    and m["score"]["fullTime"]["home"] is not None]
-        new = [m for m in finished if str(m["id"]) not in posted]
-        log.info(f"Poll: {len(all_recent)} total, {len(finished)} finished, {len(new)} new to post")
-        if not new: log.info(f"Poll: {len(finished)} finished, 0 new"); return
-        for match in new:
+
+        # Also catch matches that just ended but API hasn't flipped to FINISHED yet
+        # If score exists and it's past expected end time, treat as finished
+        just_ended = []
+        for m in all_recent:
+            if m["status"] in ("IN_PLAY","PAUSED","EXTRA_TIME") and m["score"]["fullTime"]["home"] is not None:
+                kickoff_et = utc_to_et(m["utcDate"])
+                mins_since_kickoff = (et_now() - kickoff_et).total_seconds() / 60
+                if mins_since_kickoff > 110:  # 90 + 20 min buffer
+                    log.info(f"Treating {m['homeTeam']['name']} vs {m['awayTeam']['name']} as finished (status={m['status']} but {mins_since_kickoff:.0f} mins elapsed)")
+                    just_ended.append(m)
+
+        all_finished = finished + [m for m in just_ended if m not in finished]
+        new = [m for m in all_finished if str(m["id"]) not in posted]
+        log.info(f"Poll: {len(all_recent)} total, {len(all_finished)} finished, {len(new)} new to post")
+        if not new: log.info(f"Poll: {len(all_finished)} finished, 0 new"); return
+        for match in new:  # new = unposted finished matches
             mid   = str(match["id"])
             home  = match["homeTeam"]["name"]
             away  = match["awayTeam"]["name"]
