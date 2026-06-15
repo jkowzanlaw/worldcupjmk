@@ -825,28 +825,38 @@ def job_recap_card():
 
         today_et  = et_now()
         dn        = day_number()
+        hour_et   = today_et.hour
 
-        # Fetch today AND tomorrow ET — catches midnight games like Austria vs Jordan
-        # that kick off at 12am ET (technically next ET day but same broadcast day)
-        today_str    = et_today()
-        tomorrow_str = (today_et + timedelta(days=1)).strftime("%Y-%m-%d")
-        # date_str reflects today's broadcast day (not tomorrow if we're past midnight)
-        date_str  = today_et.strftime("%A, %B %-d")
-        all_today    = get_matches_for_et_date(today_str)
-        all_tomorrow = get_matches_for_et_date(tomorrow_str)
+        # KEY INSIGHT: recap runs at/after midnight ET.
+        # At midnight ET, et_today() = new day, but the games we want to recap
+        # are from YESTERDAY ET. So if hour < 6, look at yesterday's matches.
+        # If hour >= 6, look at today's matches (recap fires after all games done).
+        if hour_et < 6:
+            # After midnight — recap covers yesterday ET's games
+            primary_str  = (today_et - timedelta(days=1)).strftime("%Y-%m-%d")
+            overflow_str = et_today()  # midnight games fall on today ET
+            date_str     = (today_et - timedelta(days=1)).strftime("%A, %B %-d")
+        else:
+            # Before midnight — recap covers today ET's games
+            primary_str  = et_today()
+            overflow_str = (today_et + timedelta(days=1)).strftime("%Y-%m-%d")
+            date_str     = today_et.strftime("%A, %B %-d")
 
-        # Only include tomorrow games that kick off between midnight and 3am ET
-        # (these are the late games that belong to today's broadcast day)
-        midnight_games = [m for m in all_tomorrow
+        all_primary  = get_matches_for_et_date(primary_str)
+        all_overflow = get_matches_for_et_date(overflow_str)
+
+        # Include overflow games that kick off between midnight and 3am ET
+        # These belong to the primary broadcast day (e.g. Austria vs Jordan at 12am ET)
+        midnight_games = [m for m in all_overflow
                          if utc_to_et(m["utcDate"]).hour < 3]
 
-        all_day = all_today + midnight_games
+        all_day = all_primary + midnight_games
 
         if not all_day:
-            log.info("Recap job: no matches today, skipping")
+            log.info(f"Recap job: no matches found for {primary_str} ET, skipping")
             mark_recap_done(); return
 
-        log.info(f"Recap job: {len(all_today)} ET-today + {len(midnight_games)} midnight games = {len(all_day)} total")
+        log.info(f"Recap covering {primary_str} ET ({len(all_primary)} matches) + {len(midnight_games)} midnight games = {len(all_day)} total")
 
         finished = [m for m in all_day if m["status"] in ("FINISHED","FULL_TIME")]
         pending  = [m for m in all_day if m["status"] not in ("FINISHED","FULL_TIME")]
