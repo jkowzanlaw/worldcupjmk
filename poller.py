@@ -814,33 +814,62 @@ def mark_recap_done():
 
 
 def job_recap_card():
-    """Generate end-of-day recap card — only after ALL of today's matches are finished."""
+    """Generate end-of-day recap card — only after ALL of today's matches are finished.
+    Fetches today AND tomorrow ET to catch midnight games that cross the date boundary."""
     try:
         if recap_done_today(): return
 
-        today_et = et_now()
+        today_et  = et_now()
         date_str  = today_et.strftime("%A, %B %-d")
         dn        = day_number()
 
-        # Get ALL of today's matches
-        all_today = get_todays_matches()
-        if not all_today:
+        # Fetch today AND tomorrow ET — catches midnight games like Austria vs Jordan
+        # that kick off at 12am ET (technically next ET day but same broadcast day)
+        today_str    = et_today()
+        tomorrow_str = (today_et + timedelta(days=1)).strftime("%Y-%m-%d")
+        all_today    = get_matches_for_et_date(today_str)
+        all_tomorrow = get_matches_for_et_date(tomorrow_str)
+
+        # Only include tomorrow games that kick off between midnight and 3am ET
+        # (these are the late games that belong to today's broadcast day)
+        midnight_games = [m for m in all_tomorrow
+                         if utc_to_et(m["utcDate"]).hour < 3]
+
+        all_day = all_today + midnight_games
+
+        if not all_day:
             log.info("Recap job: no matches today, skipping")
             mark_recap_done(); return
 
-        finished = [m for m in all_today if m["status"] in ("FINISHED","FULL_TIME")]
-        pending  = [m for m in all_today if m["status"] not in ("FINISHED","FULL_TIME")]
+        log.info(f"Recap job: {len(all_today)} ET-today + {len(midnight_games)} midnight games = {len(all_day)} total")
 
-        if not finished:
+        finished = [m for m in all_day if m["status"] in ("FINISHED","FULL_TIME")]
+        pending  = [m for m in all_day if m["status"] not in ("FINISHED","FULL_TIME")]
+
+        # Also count just-ended games (status not updated yet but 110+ mins elapsed)
+        just_ended = []
+        for m in pending:
+            if m["score"]["fullTime"]["home"] is not None:
+                kickoff_et = utc_to_et(m["utcDate"])
+                mins = (et_now() - kickoff_et).total_seconds() / 60
+                if mins > 110:
+                    just_ended.append(m)
+                    log.info(f"Recap: counting {m['homeTeam']['name']} vs {m['awayTeam']['name']} as finished ({mins:.0f} mins elapsed)")
+
+        truly_pending = [m for m in pending if m not in just_ended]
+        all_finished  = finished + just_ended
+
+        if not all_finished:
             log.info("Recap job: no finished matches yet, skipping")
             return
 
-        if pending:
-            pending_names = [f"{m['homeTeam']['name']} vs {m['awayTeam']['name']}" for m in pending]
-            log.info(f"Recap job: {len(pending)} matches still in progress — waiting: {pending_names}")
+        if truly_pending:
+            names = [f"{m['homeTeam']['name']} vs {m['awayTeam']['name']}" for m in truly_pending]
+            log.info(f"Recap job: {len(truly_pending)} still pending — waiting: {names}")
             return
 
-        log.info(f"Recap job: all {len(finished)} matches finished — generating recap")
+        log.info(f"Recap job: all {len(all_finished)} matches done — generating recap")
+        finished = all_finished  # use combined list for recap generation
 
         # Build results list
         results = []
