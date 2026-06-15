@@ -806,11 +806,15 @@ def claude_recap_content(day_num, results, scorers_raw, standings_raw):
         return None
 
 
+def recap_key():
+    """Use day number as recap key — stable across midnight ET boundary."""
+    return f"recap_day{day_number()}"
+
 def recap_done_today():
-    return (TMP_DIR / f"recap_{et_today().replace('-','')}.done").exists()
+    return (TMP_DIR / f"{recap_key()}.done").exists()
 
 def mark_recap_done():
-    (TMP_DIR / f"recap_{et_today().replace('-','')}.done").touch()
+    (TMP_DIR / f"{recap_key()}.done").touch()
 
 
 def job_recap_card():
@@ -820,13 +824,14 @@ def job_recap_card():
         if recap_done_today(): return
 
         today_et  = et_now()
-        date_str  = today_et.strftime("%A, %B %-d")
         dn        = day_number()
 
         # Fetch today AND tomorrow ET — catches midnight games like Austria vs Jordan
         # that kick off at 12am ET (technically next ET day but same broadcast day)
         today_str    = et_today()
         tomorrow_str = (today_et + timedelta(days=1)).strftime("%Y-%m-%d")
+        # date_str reflects today's broadcast day (not tomorrow if we're past midnight)
+        date_str  = today_et.strftime("%A, %B %-d")
         all_today    = get_matches_for_et_date(today_str)
         all_tomorrow = get_matches_for_et_date(tomorrow_str)
 
@@ -934,7 +939,7 @@ def job_recap_card():
             {"name":"Golden Boot","team":"TBD","goals":0}]
 
         # Generate card
-        img_path = str(TMP_DIR / f"recap_{et_today().replace('-','')}.png")
+        img_path = str(TMP_DIR / f"{recap_key()}.png")
         img_path = make_recap_card(dn, date_str, results, standings, scorers_card, stat_hero, img_path)
 
         # Build full caption with hashtags
@@ -1137,7 +1142,7 @@ def main():
     download_fonts()
     schedule.every(5).minutes.do(job_result_and_recap)  # 5 min = 12 calls/hr, safe for free tier
     schedule.every().day.at("12:00").do(job_schedule_card)  # 8am ET = 12:00 UTC
-    schedule.every().day.at("04:00").do(job_recap_card)     # midnight ET = 04:00 UTC
+    # Recap fires via 5-min poll job_result_and_recap() — no fixed schedule needed
     # ── API health check on startup ───────────────────────────────────────────
     log.info("Checking football-data.org API...")
     try:
