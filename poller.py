@@ -609,19 +609,26 @@ def job_result_cards():
             venue = match.get("venue","") or ""
             today = et_now().strftime("%B %-d, %Y")
             log.info(f"New result: {home} {hs}–{as_} {away}")
-            insight   = claude_insight(home, away, hs, as_, stage)
-            hashtags  = build_hashtag_block(home, away, stage)
-            caption   = claude_result_caption(home, away, hs, as_, stage, insight, hashtags)
-            log.info(f"Insight: {insight}")
-            safe = f"{home.replace(' ','_')}_vs_{away.replace(' ','_')}_{mid}"
-            img_path = str(TMP_DIR / f"{safe}.png")
-            img_path = make_result_card(home, away, hs, as_, stage, venue, insight, today, img_path)
-            fname_out = Path(img_path).name
-            fname_stem = Path(img_path).stem
-            upload_dropbox(img_path, fname_out)
-            save_caption_file(caption, fname_stem)
-            posted.add(mid); save_posted(posted)
-            log.info(f"Posted: {safe}")
+            try:
+                insight   = claude_insight(home, away, hs, as_, stage)
+                hashtags  = build_hashtag_block(home, away, stage)
+                caption   = claude_result_caption(home, away, hs, as_, stage, insight, hashtags)
+                log.info(f"Insight: {insight}")
+                safe = f"{home.replace(' ','_')}_vs_{away.replace(' ','_')}_{mid}"
+                img_path = str(TMP_DIR / f"{safe}.png")
+                img_path = make_result_card(home, away, hs, as_, stage, venue, insight, today, img_path)
+                fname_out = Path(img_path).name
+                fname_stem = Path(img_path).stem
+                # Only mark as posted AFTER both uploads genuinely succeed
+                upload_dropbox(img_path, fname_out)
+                save_caption_file(caption, fname_stem)
+                posted.add(mid); save_posted(posted)
+                log.info(f"Posted: {safe}")
+            except Exception as card_err:
+                # Do NOT mark this match as posted if generation/upload failed —
+                # this lets the next poll retry it instead of silently skipping forever
+                log.error(f"Failed to generate/upload card for {home} vs {away} (mid={mid}): {card_err}", exc_info=True)
+                continue
     except Exception as e:
         log.error(f"Result job error: {e}", exc_info=True)
 
