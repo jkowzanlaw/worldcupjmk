@@ -997,13 +997,27 @@ def job_recap_card():
         log.error(f"Recap job error: {e}", exc_info=True)
 
 # ── Tomorrow's content generator ─────────────────────────────────────────────
+def recapped_day_number():
+    """The day_number of the broadcast day that job_recap_card most recently
+    covers, mirroring its own hour<6 'yesterday' logic. Used so tomorrow_done()
+    and job_tomorrow_content() always agree on which day they mean, even when
+    this runs right after midnight ET."""
+    now_et = et_now()
+    start = TOURNAMENT_START.astimezone(ET).date()
+    if now_et.hour < 6:
+        d = (now_et - timedelta(days=1)).date()
+    else:
+        d = now_et.date()
+    return max(1, (d - start).days + 1)
+
+def tomorrow_key():
+    return f"tomorrow_day{recapped_day_number() + 1}"
+
 def tomorrow_done():
-    tomorrow = (et_now() + timedelta(days=1)).strftime("%Y%m%d")
-    return (TMP_DIR / f"tomorrow_{tomorrow}.done").exists()
+    return (TMP_DIR / f"{tomorrow_key()}.done").exists()
 
 def mark_tomorrow_done():
-    tomorrow = (et_now() + timedelta(days=1)).strftime("%Y%m%d")
-    (TMP_DIR / f"tomorrow_{tomorrow}.done").touch()
+    (TMP_DIR / f"{tomorrow_key()}.done").touch()
 
 def claude_prediction(home, away, group, kickoff):
     """Ask Claude for a match prediction — returns dict or None."""
@@ -1123,16 +1137,29 @@ def make_pred_card(home, away, group, venue, kickoff,
     return safe_save(img, output_path)
 
 def job_tomorrow_content():
-    """Generate tomorrow schedule + AI predictions — only after recap is done."""
+    """Generate next day's schedule + AI predictions — only after recap is done.
+    Computes 'tomorrow' relative to the broadcast day just recapped, NOT the
+    current wall-clock et_now() — otherwise running after midnight ET causes
+    this to skip an extra day (e.g. recap runs at 12:40am Tue covering Monday,
+    but et_now()+1day would wrongly be Wednesday instead of Tuesday)."""
     try:
         if tomorrow_done(): return
         if not recap_done_today():
             log.debug("Tomorrow content waiting for recap to complete first")
             return
-        tomorrow_et = et_now() + timedelta(days=1)
+
+        # Use the SAME recapped-day reference as tomorrow_key() so the date
+        # computed here always matches the done-marker that gated this job.
+        now_et = et_now()
+        if now_et.hour < 6:
+            recapped_day_et = (now_et - timedelta(days=1))
+        else:
+            recapped_day_et = now_et
+
+        tomorrow_et = recapped_day_et + timedelta(days=1)
         tomorrow_str = tomorrow_et.strftime("%Y-%m-%d")
         date_str = tomorrow_et.strftime("%A, %B %-d")
-        dn = day_number() + 1
+        dn = recapped_day_number() + 1
         matches_raw = get_matches_for_et_date(tomorrow_str)
         if not matches_raw:
             log.info("No matches tomorrow — skipping tomorrow content")
