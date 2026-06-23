@@ -580,18 +580,28 @@ def job_result_cards():
                    if m["status"] in ("FINISHED","FULL_TIME")
                    and m["score"]["fullTime"]["home"] is not None]
 
-        # Also catch matches that just ended but API hasn't flipped to FINISHED yet
+        # Also catch matches that just ended but API hasn't flipped to FINISHED yet.
+        # IMPORTANT: PAUSED status can mean a genuine weather/safety suspension that
+        # restarts later (not actually finished) — so PAUSED gets a much longer grace
+        # period than IN_PLAY before we assume it is over, to avoid posting a card
+        # for a match that is still going to resume and change the score.
         just_ended = []
         for m in all_recent:
             try:
-                if m["status"] in ("IN_PLAY","PAUSED","EXTRA_TIME"):
+                status = m["status"]
+                if status in ("IN_PLAY","PAUSED","EXTRA_TIME"):
                     ft = m.get("score",{}).get("fullTime",{})
                     if ft.get("home") is not None:
                         kickoff_et = utc_to_et(m["utcDate"])
                         mins_since_kickoff = (et_now() - kickoff_et).total_seconds() / 60
-                        if mins_since_kickoff > 110:
-                            log.info(f"Treating {m['homeTeam']['name']} vs {m['awayTeam']['name']} as finished ({mins_since_kickoff:.0f} mins elapsed)")
+                        # PAUSED (weather/safety delay) needs much longer before we
+                        # treat it as finished — delays can run 1-2+ hours legitimately
+                        threshold = 240 if status == "PAUSED" else 110
+                        if mins_since_kickoff > threshold:
+                            log.info(f"Treating {m['homeTeam']['name']} vs {m['awayTeam']['name']} as finished (status={status}, {mins_since_kickoff:.0f} mins elapsed, threshold={threshold})")
                             just_ended.append(m)
+                        else:
+                            log.debug(f"{m['homeTeam']['name']} vs {m['awayTeam']['name']} still {status} ({mins_since_kickoff:.0f}/{threshold} mins) — not yet treating as finished")
             except Exception as e:
                 log.warning(f"just_ended check error for match {m.get('id','??')}: {e}")
 
