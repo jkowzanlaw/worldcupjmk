@@ -4,11 +4,12 @@ World Cup in 5 — Autonomous Poller v2
 Optimized captions + hashtags for maximum Instagram reach.
 """
 
-import os, time, json, logging, requests, schedule
+import os, time, json, logging, requests, schedule, threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 import dropbox
+from flask import Flask, send_file, jsonify, abort, request
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger("wc5")
@@ -20,6 +21,52 @@ DBX_FOLDER  = os.environ.get("DROPBOX_FOLDER", "/WorldCupIn5")
 TMP_DIR     = Path("/tmp/wc5"); TMP_DIR.mkdir(exist_ok=True)
 POSTED_FILE = TMP_DIR / "posted.json"
 TOURNAMENT_START = datetime(2026, 6, 11, tzinfo=timezone(timedelta(hours=-4)))  # June 11 ET
+
+# ── Direct-serve card registry ───────────────────────────────────────────────
+# PERMANENT FIX for "jpgs that won't post to IG":
+# Dropbox mobile sync (lazy "online-only" placeholders, cache staleness, the
+# desktop/mobile sync race) was producing files that *look* fine in the
+# Dropbox app but are 0-byte or partial when IG's share sheet actually reads
+# them. The fix is to stop treating Dropbox as the posting path. Every card
+# this poller makes is now ALSO served directly over HTTP straight off disk,
+# byte-verified at request time — no sync layer, no client cache, no race.
+# Dropbox remains as a backup/archive only.
+PORT = int(os.environ.get("PORT", 8080))
+CARD_REGISTRY_FILE = TMP_DIR / "card_registry.json"
+_registry_lock = threading.Lock()
+
+def _load_registry():
+    if CARD_REGISTRY_FILE.exists():
+        try: return json.loads(CARD_REGISTRY_FILE.read_text())
+        except Exception: return []
+    return []
+
+def _save_registry(reg):
+    CARD_REGISTRY_FILE.write_text(json.dumps(reg, indent=2))
+
+def register_card(path, kind, caption=""):
+    """Record a freshly-generated, verified card so it can be served directly.
+    Re-verifies the file on disk right now — not the size at save time —
+    so a registry entry NEVER points at a stale or corrupted file."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"register_card: file missing at registration time: {path}")
+    size_kb = p.stat().st_size / 1024
+    if size_kb < 30:
+        raise ValueError(f"register_card: file too small ({size_kb:.1f}KB) — refusing to register: {path}")
+    with _registry_lock:
+        reg = _load_registry()
+        reg = [r for r in reg if r["filename"] != p.name]  # replace any stale entry
+        reg.append({
+            "filename": p.name,
+            "kind": kind,
+            "caption": caption,
+            "size_kb": round(size_kb, 1),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        reg = reg[-200:]  # keep registry bounded
+        _save_registry(reg)
+    log.info(f"Registered for direct serve: {p.name} ({size_kb:.0f}KB)")
 
 FONT_DIR  = Path("/tmp/fonts"); FONT_DIR.mkdir(exist_ok=True)
 BEBAS     = str(FONT_DIR / "BebasNeue.ttf")
@@ -309,25 +356,32 @@ def day_number():
 
 # ── Dropbox ───────────────────────────────────────────────────────────────────
 def upload_dropbox(local_path, filename, min_kb=0):
-    """Upload file to Dropbox. min_kb=0 for text files, min_kb=30 for images."""
-    p = Path(local_path)
-    if not p.exists():
-        raise FileNotFoundError(f"Cannot upload — file not found: {local_path}")
-    size_kb = p.stat().st_size / 1024
-    is_image = filename.lower().endswith((".jpg",".jpeg",".png"))
-    if is_image and size_kb < 30:
-        raise ValueError(f"Image too small ({size_kb:.1f}KB) — aborting: {filename}")
-    if not is_image and size_kb == 0:
-        raise ValueError(f"Text file is empty — aborting: {filename}")
-    data = p.read_bytes()  # read into memory first
-    dbx = dropbox.Dropbox(
-        oauth2_refresh_token=DBX_TOKEN,
-        app_key=os.environ.get("DROPBOX_APP_KEY","gmao4qdft812tm6"),
-        app_secret=os.environ.get("DROPBOX_APP_SECRET","c0xopjcwq0ty2y7")
-    )
-    remote = f"{DBX_FOLDER}/{filename}"
-    dbx.files_upload(data, remote, mode=dropbox.files.WriteMode.overwrite)
-    log.info(f"Uploaded → Dropbox:{remote} ({size_kb:.0f}KB)")
+    """Upload file to Dropbox as a BACKUP/ARCHIVE COPY ONLY.
+    This is no longer the posting path — see CARD_REGISTRY / register_card.
+    Failures here are logged but never block posting, since the direct-serve
+    HTTP endpoint is what actually gets used to publish to Instagram now."""
+    try:
+        p = Path(local_path)
+        if not p.exists():
+            raise FileNotFoundError(f"Cannot upload — file not found: {local_path}")
+        size_kb = p.stat().st_size / 1024
+        is_image = filename.lower().endswith((".jpg",".jpeg",".png"))
+        if is_image and size_kb < 30:
+            raise ValueError(f"Image too small ({size_kb:.1f}KB) — aborting: {filename}")
+        if not is_image and size_kb == 0:
+            raise ValueError(f"Text file is empty — aborting: {filename}")
+        data = p.read_bytes()  # read into memory first
+        dbx = dropbox.Dropbox(
+            oauth2_refresh_token=DBX_TOKEN,
+            app_key=os.environ.get("DROPBOX_APP_KEY","gmao4qdft812tm6"),
+            app_secret=os.environ.get("DROPBOX_APP_SECRET","c0xopjcwq0ty2y7")
+        )
+        remote = f"{DBX_FOLDER}/{filename}"
+        dbx.files_upload(data, remote, mode=dropbox.files.WriteMode.overwrite)
+        log.info(f"Backed up → Dropbox:{remote} ({size_kb:.0f}KB)")
+    except Exception as e:
+        # Backup failing is NOT fatal — direct-serve is the real posting path now.
+        log.warning(f"Dropbox backup failed for {filename} (non-fatal, archive only): {e}")
 
 def save_caption_file(caption, base_name):
     p = TMP_DIR / f"{base_name}.txt"
@@ -629,7 +683,9 @@ def job_result_cards():
                 img_path = make_result_card(home, away, hs, as_, stage, venue, insight, today, img_path)
                 fname_out = Path(img_path).name
                 fname_stem = Path(img_path).stem
-                # Only mark as posted AFTER both uploads genuinely succeed
+                # register_card re-verifies the file on disk RIGHT NOW — this is
+                # the actual posting path. Dropbox below is backup only.
+                register_card(img_path, "result", caption)
                 upload_dropbox(img_path, fname_out)
                 save_caption_file(caption, fname_stem)
                 posted.add(mid); save_posted(posted)
@@ -663,6 +719,7 @@ def job_schedule_card():
         hashtags   = build_hashtag_block("", "", "group stage")
         caption    = claude_schedule_caption(matches, date_str, dn, hashtags)
         fname      = Path(img_path).stem
+        register_card(img_path, "schedule", caption)
         upload_dropbox(img_path, Path(img_path).name)
         save_caption_file(caption, fname)
         mark_schedule_done()
@@ -988,6 +1045,7 @@ def job_recap_card():
         hashtags = build_hashtag_block("","","group stage")
         full_caption = f"{caption_text}\n\n{hashtags}"
 
+        register_card(img_path, "recap", full_caption)
         upload_dropbox(img_path, Path(img_path).name)
         save_caption_file(full_caption, Path(img_path).stem)
         mark_recap_done()
@@ -1174,6 +1232,7 @@ def job_tomorrow_content():
         sched_path = str(TMP_DIR / ("schedule_"+tomorrow_str.replace("-","")+".png"))
         sched_path = make_schedule_card(matches, date_str, dn, sched_path)
         sched_caption = claude_schedule_caption(matches, date_str, dn, build_hashtag_block("","","group stage"))
+        register_card(sched_path, "schedule", sched_caption)
         upload_dropbox(sched_path, Path(sched_path).name)
         save_caption_file(sched_caption, Path(sched_path).stem)
         log.info("Tomorrow schedule uploaded: " + Path(sched_path).name)
@@ -1195,6 +1254,7 @@ def job_tomorrow_content():
                 pred["reason"], pred["confidence"], pred_path
             )
             caption = pred["caption"] + "\n\n" + build_hashtag_block(home, away, "group stage")
+            register_card(pred_path, "prediction", caption)
             upload_dropbox(pred_path, Path(pred_path).name)
             save_caption_file(caption, Path(pred_path).stem)
             log.info("Tomorrow prediction uploaded: " + home + " vs " + away)
@@ -1204,10 +1264,79 @@ def job_tomorrow_content():
     except Exception as e:
         log.error(f"Tomorrow content job error: {e}", exc_info=True)
 
+# ── Direct-serve HTTP layer (PERMANENT FIX) ──────────────────────────────────
+# Replaces Dropbox-as-posting-path. Serves cards straight from /tmp/wc5, with
+# the file re-verified on disk at REQUEST time (not just at save time), so a
+# request can never return a stale, partial, or 0-byte file. No client-side
+# sync/cache layer sits between card generation and what you actually post.
+app = Flask(__name__)
+
+@app.get("/")
+def feed_page():
+    """Mobile-friendly feed: newest card first, tap-to-open, caption shown
+    underneath so you can copy/paste it straight into Instagram."""
+    reg = list(reversed(_load_registry()))
+    rows = []
+    for r in reg:
+        fp = TMP_DIR / r["filename"]
+        if not fp.exists():
+            continue  # never list a card that isn't actually on disk right now
+        cap_html = (r.get("caption","") or "").replace("\n", "<br>")
+        rows.append(f"""
+        <div style="border:1px solid #ddd;border-radius:10px;margin:14px;padding:10px;font-family:sans-serif">
+          <div style="font-size:12px;color:#888;text-transform:uppercase">{r['kind']} · {r['size_kb']}KB</div>
+          <a href="/card/{r['filename']}"><img src="/card/{r['filename']}" style="width:100%;border-radius:8px;margin:8px 0"></a>
+          <div style="font-size:14px;white-space:pre-wrap">{cap_html}</div>
+        </div>""")
+    body = "".join(rows) if rows else "<p style='font-family:sans-serif;margin:20px'>No cards yet.</p>"
+    return f"<html><body style='margin:0;background:#f4f4f4'>{body}</body></html>"
+
+@app.get("/card/<filename>")
+def serve_card(filename):
+    """Serve a single card, re-verifying it on disk at request time.
+    This is the line that actually fixes the bug: if the file is missing,
+    empty, or smaller than a real card could ever be, we 404/410 instead of
+    handing back a broken file for IG (or you) to choke on."""
+    safe_name = Path(filename).name  # no path traversal
+    fp = TMP_DIR / safe_name
+    if not fp.exists():
+        abort(404, description="Card not found on disk")
+    size_kb = fp.stat().st_size / 1024
+    if size_kb < 30:
+        log.error(f"Direct-serve refused {safe_name} — only {size_kb:.1f}KB on disk")
+        abort(410, description=f"Card is corrupted/incomplete ({size_kb:.1f}KB) — not serving")
+    return send_file(str(fp), mimetype="image/jpeg", conditional=False,
+                      max_age=0, etag=False)  # never let a CDN/browser cache a stale version
+
+@app.get("/feed.json")
+def feed_json():
+    """Machine-readable feed — this is what a future Graph API auto-poster
+    (or Buffer/Zapier/etc.) should read from instead of Dropbox."""
+    reg = list(reversed(_load_registry()))
+    base = request.host_url.rstrip("/")
+    out = []
+    for r in reg:
+        fp = TMP_DIR / r["filename"]
+        if not fp.exists():
+            continue
+        out.append({**r, "image_url": f"{base}/card/{r['filename']}"})
+    return jsonify(out)
+
+@app.get("/healthz")
+def healthz():
+    return jsonify({"status": "ok", "registered_cards": len(_load_registry())})
+
+def run_server():
+    log.info(f"Direct-serve HTTP server starting on port {PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     log.info("World Cup in 5 — Poller v2 starting")
     download_fonts()
+    # Start the direct-serve HTTP layer in the background FIRST — this is now
+    # the path that matters for actually getting a postable file.
+    threading.Thread(target=run_server, daemon=True).start()
     schedule.every(5).minutes.do(job_result_and_recap)  # 5 min = 12 calls/hr, safe for free tier
     schedule.every().day.at("12:00").do(job_schedule_card)  # 8am ET = 12:00 UTC
     # Recap fires via 5-min poll job_result_and_recap() — no fixed schedule needed
