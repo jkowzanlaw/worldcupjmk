@@ -4,7 +4,7 @@ World Cup in 5 — Autonomous Poller v2
 Optimized captions + hashtags for maximum Instagram reach.
 """
 
-import os, time, json, logging, requests, schedule, threading
+import os, time, json, logging, requests, schedule, threading, base64
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
@@ -18,6 +18,18 @@ FD_KEY      = os.environ["FOOTBALL_API_KEY"]
 DBX_TOKEN   = os.environ["DROPBOX_TOKEN"]
 CLAUDE_KEY  = os.environ["ANTHROPIC_API_KEY"]
 DBX_FOLDER  = os.environ.get("DROPBOX_FOLDER", "/WorldCupIn5")
+
+# ── GitHub upload config (second, independent delivery path for cards) ──────
+# Added because Meta Business Suite was rejecting files coming through
+# Dropbox even though the files themselves verify as clean, valid JPEGs.
+# GitHub gives a second, independent path so Julia can grab a known-good
+# copy of every card without depending on Dropbox's sync/preview layer.
+# GITHUB_TOKEN must be a fine-grained PAT with "Contents: Read and write"
+# access scoped to this repo, set as a Railway env var.
+GITHUB_TOKEN     = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO      = os.environ.get("GITHUB_REPO", "jkowzanlaw/worldcupjmk")
+GITHUB_FOLDER    = os.environ.get("GITHUB_FOLDER", "output")
+GITHUB_BRANCH    = os.environ.get("GITHUB_BRANCH", "main")
 TMP_DIR     = Path("/tmp/wc5"); TMP_DIR.mkdir(exist_ok=True)
 POSTED_FILE = TMP_DIR / "posted.json"
 TOURNAMENT_START = datetime(2026, 6, 11, tzinfo=timezone(timedelta(hours=-4)))  # June 11 ET
@@ -383,10 +395,68 @@ def upload_dropbox(local_path, filename, min_kb=0):
         # Backup failing is NOT fatal — direct-serve is the real posting path now.
         log.warning(f"Dropbox backup failed for {filename} (non-fatal, archive only): {e}")
 
+def upload_github(local_path, filename, min_kb=0):
+    """Upload file to GitHub as a SECOND, INDEPENDENT backup path.
+    Why this exists: Meta Business Suite was rejecting files coming through
+    Dropbox even though every file verifies as a clean, valid JPEG on disk.
+    Rather than keep guessing at what Dropbox's sync/preview layer might be
+    doing to the bytes, this gives Julia a second, independent place to grab
+    a known-good copy from — raw.githubusercontent.com URLs, viewable/
+    downloadable straight from the GitHub app or any browser.
+    Uses the GitHub Contents API (PUT /repos/{repo}/contents/{path}), which
+    requires the full file content base64-encoded in a single request — no
+    chunking, no resumable session, nothing in between that could mangle
+    bytes the way a sync client might.
+    Like Dropbox, failures here are logged but never block posting."""
+    if not GITHUB_TOKEN:
+        log.warning("GitHub backup skipped — GITHUB_TOKEN not set")
+        return
+    try:
+        p = Path(local_path)
+        if not p.exists():
+            raise FileNotFoundError(f"Cannot upload — file not found: {local_path}")
+        size_kb = p.stat().st_size / 1024
+        is_image = filename.lower().endswith((".jpg",".jpeg",".png"))
+        if is_image and size_kb < 30:
+            raise ValueError(f"Image too small ({size_kb:.1f}KB) — aborting: {filename}")
+        if not is_image and size_kb == 0:
+            raise ValueError(f"Text file is empty — aborting: {filename}")
+        data = p.read_bytes()  # read into memory first, same as Dropbox path
+        content_b64 = base64.b64encode(data).decode("ascii")
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FOLDER}/{filename}"
+        headers = {
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        # Check if file already exists at this path — GitHub's Contents API
+        # requires the current blob SHA to overwrite an existing file,
+        # otherwise it 409s. A fresh filename (no prior SHA) creates new.
+        existing_sha = None
+        get_resp = requests.get(api_url, headers=headers, params={"ref": GITHUB_BRANCH}, timeout=15)
+        if get_resp.status_code == 200:
+            existing_sha = get_resp.json().get("sha")
+        payload = {
+            "message": f"Update {filename} ({size_kb:.0f}KB)",
+            "content": content_b64,
+            "branch": GITHUB_BRANCH,
+        }
+        if existing_sha:
+            payload["sha"] = existing_sha
+        put_resp = requests.put(api_url, headers=headers, json=payload, timeout=30)
+        if put_resp.status_code not in (200, 201):
+            raise RuntimeError(f"GitHub API {put_resp.status_code}: {put_resp.text[:300]}")
+        raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/{GITHUB_FOLDER}/{filename}"
+        log.info(f"Backed up → GitHub:{raw_url} ({size_kb:.0f}KB)")
+    except Exception as e:
+        # Backup failing is NOT fatal — direct-serve is the real posting path now.
+        log.warning(f"GitHub backup failed for {filename} (non-fatal, archive only): {e}")
+
 def save_caption_file(caption, base_name):
     p = TMP_DIR / f"{base_name}.txt"
     p.write_text(caption, encoding="utf-8")
     upload_dropbox(str(p), f"{base_name}.txt")
+    upload_github(str(p), f"{base_name}.txt")
 
 # ── State ─────────────────────────────────────────────────────────────────────
 def load_posted():
@@ -684,9 +754,10 @@ def job_result_cards():
                 fname_out = Path(img_path).name
                 fname_stem = Path(img_path).stem
                 # register_card re-verifies the file on disk RIGHT NOW — this is
-                # the actual posting path. Dropbox below is backup only.
+                # the actual posting path. Dropbox/GitHub below are backups only.
                 register_card(img_path, "result", caption)
                 upload_dropbox(img_path, fname_out)
+                upload_github(img_path, fname_out)
                 save_caption_file(caption, fname_stem)
                 posted.add(mid); save_posted(posted)
                 log.info(f"Posted: {safe}")
@@ -721,6 +792,7 @@ def job_schedule_card():
         fname      = Path(img_path).stem
         register_card(img_path, "schedule", caption)
         upload_dropbox(img_path, Path(img_path).name)
+        upload_github(img_path, Path(img_path).name)
         save_caption_file(caption, fname)
         mark_schedule_done()
         log.info(f"Schedule posted: {date_str}")
@@ -1047,6 +1119,7 @@ def job_recap_card():
 
         register_card(img_path, "recap", full_caption)
         upload_dropbox(img_path, Path(img_path).name)
+        upload_github(img_path, Path(img_path).name)
         save_caption_file(full_caption, Path(img_path).stem)
         mark_recap_done()
         log.info(f"Recap card posted for {date_str}")
@@ -1234,6 +1307,7 @@ def job_tomorrow_content():
         sched_caption = claude_schedule_caption(matches, date_str, dn, build_hashtag_block("","","group stage"))
         register_card(sched_path, "schedule", sched_caption)
         upload_dropbox(sched_path, Path(sched_path).name)
+        upload_github(sched_path, Path(sched_path).name)
         save_caption_file(sched_caption, Path(sched_path).stem)
         log.info("Tomorrow schedule uploaded: " + Path(sched_path).name)
         # Prediction cards
@@ -1256,6 +1330,7 @@ def job_tomorrow_content():
             caption = pred["caption"] + "\n\n" + build_hashtag_block(home, away, "group stage")
             register_card(pred_path, "prediction", caption)
             upload_dropbox(pred_path, Path(pred_path).name)
+            upload_github(pred_path, Path(pred_path).name)
             save_caption_file(caption, Path(pred_path).stem)
             log.info("Tomorrow prediction uploaded: " + home + " vs " + away)
             time.sleep(3)
