@@ -1403,7 +1403,7 @@ def healthz():
 
 def run_server():
     log.info(f"Direct-serve HTTP server starting on port {PORT}")
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
