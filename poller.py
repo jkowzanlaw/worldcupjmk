@@ -1479,6 +1479,1451 @@ def main():
         time.sleep(30)
 
 if __name__ == "__main__":
+    main()# ── Direct-serve card registry ───────────────────────────────────────────────
+# PERMANENT FIX for "jpgs that won't post to IG":
+# Dropbox mobile sync (lazy "online-only" placeholders, cache staleness, the
+# desktop/mobile sync race) was producing files that *look* fine in the
+# Dropbox app but are 0-byte or partial when IG's share sheet actually reads
+# them. The fix is to stop treating Dropbox as the posting path. Every card
+# this poller makes is now ALSO served directly over HTTP straight off disk,
+# byte-verified at request time — no sync layer, no client cache, no race.
+# Dropbox remains as a backup/archive only.
+PORT = int(os.environ.get("PORT", 8080))
+CARD_REGISTRY_FILE = TMP_DIR / "card_registry.json"
+_registry_lock = threading.Lock()
+
+def _load_registry():
+    if CARD_REGISTRY_FILE.exists():
+        try: return json.loads(CARD_REGISTRY_FILE.read_text())
+        except Exception: return []
+    return []
+
+def _save_registry(reg):
+    CARD_REGISTRY_FILE.write_text(json.dumps(reg, indent=2))
+
+def register_card(path, kind, caption=""):
+    """Record a freshly-generated, verified card so it can be served directly.
+    Re-verifies the file on disk right now — not the size at save time —
+    so a registry entry NEVER points at a stale or corrupted file."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"register_card: file missing at registration time: {path}")
+    size_kb = p.stat().st_size / 1024
+    if size_kb < 30:
+        raise ValueError(f"register_card: file too small ({size_kb:.1f}KB) — refusing to register: {path}")
+    with _registry_lock:
+        reg = _load_registry()
+        reg = [r for r in reg if r["filename"] != p.name]  # replace any stale entry
+        reg.append({
+            "filename": p.name,
+            "kind": kind,
+            "caption": caption,
+            "size_kb": round(size_kb, 1),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        reg = reg[-200:]  # keep registry bounded
+        _save_registry(reg)
+    log.info(f"Registered for direct serve: {p.name} ({size_kb:.0f}KB)")
+
+FONT_DIR  = Path("/tmp/fonts"); FONT_DIR.mkdir(exist_ok=True)
+BEBAS     = str(FONT_DIR / "BebasNeue.ttf")
+POPPINS_B = str(FONT_DIR / "Poppins-Bold.ttf")
+POPPINS_M = str(FONT_DIR / "Poppins-Medium.ttf")
+POPPINS_R = str(FONT_DIR / "Poppins-Regular.ttf")
+
+# ── Optimized hashtag sets ────────────────────────────────────────────────────
+# Tiered strategy: broad (volume) + mid (targeted) + niche (less competition)
+CORE_HASHTAGS = [
+    "#WorldCup2026", "#FIFAWorldCup", "#FWC26", "#WeAre26",
+    "#WorldCup", "#Soccer", "#Football", "#FIFA",
+]
+MID_HASHTAGS = [
+    "#WorldCupResults", "#MatchDay", "#FootballDaily",
+    "#SoccerNews", "#WorldCupIn5", "#FutbolMundial",
+    "#Golazo2026", "#WC2026",
+]
+NICHE_HASHTAGS = [
+    "#FootballAnalysis", "#SoccerStats", "#MatchResult",
+    "#WorldCupScores", "#FootballFans", "#SoccerFans",
+    "#Somos26", "#FootballCommunity",
+]
+
+def hashtags_for_teams(home, away):
+    """Add team-specific hashtags for maximum reach with those fanbases."""
+    team_tags = {
+        "united states": "#USMNT #USASoccer",
+        "usa": "#USMNT #USASoccer",
+        "mexico": "#ElTri #MexicoNT",
+        "brazil": "#Selecao #BrazilNT",
+        "argentina": "#Albiceleste #ArgentinaFutbol",
+        "france": "#LesBleus #FranceNT",
+        "england": "#ThreeLions #EnglandNT",
+        "spain": "#LaRoja #SpainNT",
+        "germany": "#DieManschaft #GermanyNT",
+        "portugal": "#Selecao #PortugalNT",
+        "canada": "#CanadaSoccer #CANMNT",
+        "morocco": "#AtlasLions #MoroccoNT",
+        "japan": "#SamuraiBlue #JapanNT",
+        "south korea": "#TaegukWarriors #KoreaNT",
+        "netherlands": "#Oranje #NetherlandsNT",
+        "senegal": "#LionsDeLaTeranga #SenegalNT",
+    }
+    tags = []
+    for team in [home.lower(), away.lower()]:
+        for key, val in team_tags.items():
+            if key in team:
+                tags.extend(val.split())
+    return tags[:4]  # max 4 team tags
+
+def build_hashtag_block(home, away, stage):
+    """Build optimized hashtag string — tiered for reach + discoverability."""
+    team_tags = hashtags_for_teams(home, away)
+    # Stage-specific tags
+    stage_tags = []
+    s = stage.lower()
+    if "group" in s:        stage_tags = ["#GroupStage", "#WorldCupGroupStage"]
+    elif "round of 16" in s: stage_tags = ["#RoundOf16", "#R16"]
+    elif "quarter" in s:    stage_tags = ["#Quarterfinal", "#WorldCupQF"]
+    elif "semi" in s:       stage_tags = ["#Semifinal", "#WorldCupSF"]
+    elif "final" in s:      stage_tags = ["#WorldCupFinal", "#TheFinal"]
+
+    all_tags = CORE_HASHTAGS + MID_HASHTAGS + stage_tags + team_tags + NICHE_HASHTAGS
+    # Deduplicate, keep order, limit to 30 (Instagram best practice)
+    seen = set(); final = []
+    for t in all_tags:
+        if t not in seen: seen.add(t); final.append(t)
+    return " ".join(final[:30])
+
+# ── Claude API ────────────────────────────────────────────────────────────────
+def claude_call(prompt, max_tokens=300):
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"Content-Type":"application/json","x-api-key":CLAUDE_KEY,"anthropic-version":"2023-06-01"},
+            json={"model":"claude-sonnet-4-6","max_tokens":max_tokens,
+                  "messages":[{"role":"user","content":prompt}]},
+            timeout=30
+        )
+        if not r.ok:
+            # Log the actual response body — "400 Bad Request" alone doesn't say
+            # WHAT was rejected (bad model string, invalid param, content policy,
+            # auth issue, etc). This is what we were missing to root-cause the
+            # empty-caption incident.
+            log.error(f"Claude API error: {r.status_code} — body: {r.text[:500]}")
+            return None
+        text = r.json()["content"][0]["text"].strip()
+        if not text:
+            log.error("Claude API returned 200 but empty text content")
+            return None
+        return text
+    except Exception as e:
+        log.error(f"Claude API request exception: {e}")
+        return None
+
+def claude_insight(home, away, hs, as_, stage):
+    result = claude_call(
+        f"Write ONE punchy sentence (max 18 words) as a match insight for Instagram. "
+        f"Match: {home} {hs}\u2013{as_} {away}. Stage: {stage}. "
+        f"Sound like a sharp sports journalist. No quotes, no hashtags.",
+        max_tokens=80
+    )
+    if not result:
+        if hs > as_: result = f"{home} take all three points with a {hs}\u2013{as_} victory."
+        elif as_ > hs: result = f"{away} claim a crucial {as_}\u2013{hs} win over {home}."
+        else: result = f"{home} and {away} share the spoils in a {hs}\u2013{as_} draw."
+    return result
+
+def claude_result_caption(home, away, hs, as_, stage, insight, hashtags):
+    prompt = (
+        f"Write an Instagram caption for this World Cup result.\n\n"
+        f"RESULT: {home} {hs}\u2013{as_} {away} | {stage}\n"
+        f"KEY INSIGHT: {insight}\n\n"
+        f"FORMAT:\n"
+        f"Line 1: Bold result statement with score (1 emoji max \u26bd or \U0001f525)\n"
+        f"Line 2: One sharp tactical or storyline observation\n"
+        f"Line 3: What this result means for the tournament\n"
+        f"[blank line]\n"
+        f"{hashtags}\n\n"
+        f"Rules: Max 150 words before hashtags. No cliches. Sound like an expert."
+    )
+    result = claude_call(prompt, max_tokens=400)
+    if not result:
+        result = (
+            f"\u26bd {home} {hs}\u2013{as_} {away}\n"
+            f"{insight}\n"
+            f"Full breakdown in our story.\n\n"
+            f"{hashtags}"
+        )
+    return result
+
+def claude_schedule_caption(matches, date_str, day_num, hashtags):
+    match_lines = "\n".join([
+        f"- {m['time']}: {m['home']} vs {m['away']} ({m.get('group', m.get('stage', ''))})"
+        for m in matches
+    ])
+    prompt = (
+        f"Write an Instagram caption for a World Cup daily schedule post.\n\n"
+        f"DATE: {date_str} \u2014 Day {day_num} of the 2026 FIFA World Cup\n"
+        f"MATCHES TODAY:\n{match_lines}\n\n"
+        f"FORMAT:\n"
+        f"Line 1: Punchy opener creating urgency (1 emoji max)\n"
+        f"Line 2-3: 1-2 most compelling matchups with one reason each\n"
+        f"Line 4: CTA to save post or turn on notifications\n"
+        f"[blank line]\n"
+        f"{hashtags}\n\n"
+        f"Rules: Max 120 words before hashtags. No generic filler."
+    )
+    result = claude_call(prompt, max_tokens=350)
+    if not result:
+        lines = [f"\u26bd {m['home']} vs {m['away']}" for m in matches[:3]]
+        result = (
+            f"Day {day_num} is here \u2014 {len(matches)} matches today!\n"
+            + "\n".join(lines)
+            + f"\n\nSave this post and follow for live results.\n\n{hashtags}"
+        )
+    return result
+
+# ── Football Data API ─────────────────────────────────────────────────────────
+_api_cache = {}  # {path: (timestamp, data)}
+_last_api_call = 0
+API_MIN_INTERVAL = 7  # minimum seconds between any two API calls (safe under 10/min)
+
+def fd_get(path, retries=3, cache_secs=90):
+    """Fetch from football-data.org with caching, rate-limiting and retries.
+    cache_secs=90 means same endpoint reused within 90s won't hit API again."""
+    global _last_api_call
+
+    # Return cached response if fresh enough
+    if path in _api_cache:
+        cached_at, cached_data = _api_cache[path]
+        age = time.time() - cached_at
+        if age < cache_secs:
+            log.debug(f"API cache hit: {path} ({age:.0f}s old)")
+            return cached_data
+
+    # Enforce minimum interval between calls to avoid burst detection
+    since_last = time.time() - _last_api_call
+    if since_last < API_MIN_INTERVAL:
+        sleep_for = API_MIN_INTERVAL - since_last
+        log.debug(f"API throttle: sleeping {sleep_for:.1f}s")
+        time.sleep(sleep_for)
+
+    for attempt in range(retries):
+        try:
+            _last_api_call = time.time()
+            r = requests.get(
+                f"https://api.football-data.org/v4{path}",
+                headers={"X-Auth-Token": FD_KEY}, timeout=20
+            )
+            if r.status_code == 429:
+                wait = int(r.headers.get("X-RequestCounter-Reset", 65))
+                log.warning(f"Rate limited — waiting {wait}s (attempt {attempt+1}/{retries})")
+                time.sleep(wait)
+                continue
+            if r.status_code in (403, 401):
+                log.error(f"API auth error {r.status_code}: {path} — check API key")
+                return {}
+            if r.status_code == 404:
+                log.warning(f"API 404: {path}")
+                return {}
+            r.raise_for_status()
+            data = r.json()
+            _api_cache[path] = (time.time(), data)
+            return data
+        except requests.exceptions.Timeout:
+            log.warning(f"API timeout attempt {attempt+1}: {path}")
+            time.sleep(15)
+        except Exception as e:
+            log.error(f"API error attempt {attempt+1}: {e}")
+            time.sleep(8)
+
+    log.error(f"fd_get failed after {retries} attempts: {path}")
+    return {}
+
+def fd_get_live(path, retries=3):
+    """For live match data — short cache (10s) to catch FINISHED status fast."""
+    return fd_get(path, retries=retries, cache_secs=10)
+
+# ── ET timezone helper (EDT = UTC-4, fixed for World Cup duration June-July) ──
+ET = timezone(timedelta(hours=-4))
+
+def utc_to_et(utc_str):
+    """Parse UTC ISO string and return ET datetime."""
+    dt = datetime.fromisoformat(utc_str.replace("Z","+00:00"))
+    return dt.astimezone(ET)
+
+def et_now():
+    """Current time in ET."""
+    return datetime.now(ET)
+
+def et_today():
+    """Today's date string in ET (YYYY-MM-DD)."""
+    return et_now().strftime("%Y-%m-%d")
+
+def get_matches_for_et_date(et_date_str):
+    """Fetch all WC matches whose ET kickoff date = given ET date string YYYY-MM-DD.
+    Queries a wide UTC window (ET date -1 day to ET date +2 days) to catch all
+    matches regardless of UTC midnight crossover or API status update delays."""
+    et_date = datetime.strptime(et_date_str, "%Y-%m-%d").replace(tzinfo=ET)
+    # Wide window: day before ET date in UTC to 2 days after — catches all edge cases
+    utc_start = (et_date - timedelta(days=1)).strftime("%Y-%m-%d")
+    utc_end   = (et_date + timedelta(days=2)).strftime("%Y-%m-%d")
+    data = fd_get_live(f"/competitions/WC/matches?dateFrom={utc_start}&dateTo={utc_end}")
+    matches = data.get("matches", [])
+    result = []
+    for m in matches:
+        # Filter by ET kickoff date — this is the authoritative date for our purposes
+        m_et = utc_to_et(m["utcDate"])
+        if m_et.strftime("%Y-%m-%d") == et_date_str:
+            result.append(m)
+    log.debug(f"get_matches_for_et_date({et_date_str}): {len(result)} matches from wide UTC window")
+    return result
+
+def get_todays_matches():
+    """Fetch all WC matches for today in ET."""
+    return get_matches_for_et_date(et_today())
+
+def get_recent_unposted_matches():
+    """Fetch finished matches from today AND yesterday ET.
+    Wide UTC query window ensures late-night games finishing after midnight UTC
+    are always captured regardless of API update timing."""
+    today     = et_today()
+    yesterday = (et_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    matches   = get_matches_for_et_date(today) + get_matches_for_et_date(yesterday)
+    # Deduplicate by match id
+    seen = set(); unique = []
+    for m in matches:
+        if m["id"] not in seen:
+            seen.add(m["id"]); unique.append(m)
+    log.debug(f"get_recent_unposted_matches: {len(unique)} unique matches (today+yesterday ET)")
+    return unique
+
+def format_kickoff_et(utc_str):
+    """Format UTC kickoff time as 12-hour ET string e.g. '3:00 PM ET'."""
+    et = utc_to_et(utc_str)
+    hour12 = et.hour % 12 or 12
+    ampm = "AM" if et.hour < 12 else "PM"
+    mins = et.strftime('%M')
+    return f"{hour12}:{mins} {ampm} ET"
+
+def match_stage_label(match):
+    stage = match.get("stage","").replace("_"," ").title()
+    group = match.get("group","")
+    if group: return f"{stage} · {group.replace('GROUP_','Group ')}"
+    return stage
+
+def day_number():
+    """Day number based on ET date so midnight ET doesn't flip to next day early."""
+    today = et_now().date()
+    start = TOURNAMENT_START.astimezone(ET).date()
+    return max(1, (today - start).days + 1)
+
+# ── Dropbox ───────────────────────────────────────────────────────────────────
+def upload_dropbox(local_path, filename, min_kb=0):
+    """Upload file to Dropbox as a BACKUP/ARCHIVE COPY ONLY.
+    This is no longer the posting path — see CARD_REGISTRY / register_card.
+    Failures here are logged but never block posting, since the direct-serve
+    HTTP endpoint is what actually gets used to publish to Instagram now."""
+    try:
+        p = Path(local_path)
+        if not p.exists():
+            raise FileNotFoundError(f"Cannot upload — file not found: {local_path}")
+        size_kb = p.stat().st_size / 1024
+        is_image = filename.lower().endswith((".jpg",".jpeg",".png"))
+        if is_image and size_kb < 30:
+            raise ValueError(f"Image too small ({size_kb:.1f}KB) — aborting: {filename}")
+        if not is_image and size_kb == 0:
+            raise ValueError(f"Text file is empty — aborting: {filename}")
+        data = p.read_bytes()  # read into memory first
+        dbx = dropbox.Dropbox(
+            oauth2_refresh_token=DBX_TOKEN,
+            app_key=os.environ.get("DROPBOX_APP_KEY","gmao4qdft812tm6"),
+            app_secret=os.environ.get("DROPBOX_APP_SECRET","c0xopjcwq0ty2y7")
+        )
+        remote = f"{DBX_FOLDER}/{filename}"
+        dbx.files_upload(data, remote, mode=dropbox.files.WriteMode.overwrite)
+        log.info(f"Backed up → Dropbox:{remote} ({size_kb:.0f}KB)")
+    except Exception as e:
+        # Backup failing is NOT fatal — direct-serve is the real posting path now.
+        log.warning(f"Dropbox backup failed for {filename} (non-fatal, archive only): {e}")
+
+def upload_github(local_path, filename, min_kb=0):
+    """Upload file to GitHub as a SECOND, INDEPENDENT backup path.
+    Why this exists: Meta Business Suite was rejecting files coming through
+    Dropbox even though every file verifies as a clean, valid JPEG on disk.
+    Rather than keep guessing at what Dropbox's sync/preview layer might be
+    doing to the bytes, this gives Julia a second, independent place to grab
+    a known-good copy from — raw.githubusercontent.com URLs, viewable/
+    downloadable straight from the GitHub app or any browser.
+    Uses the GitHub Contents API (PUT /repos/{repo}/contents/{path}), which
+    requires the full file content base64-encoded in a single request — no
+    chunking, no resumable session, nothing in between that could mangle
+    bytes the way a sync client might.
+    Like Dropbox, failures here are logged but never block posting."""
+    if not GITHUB_TOKEN:
+        log.warning("GitHub backup skipped — GITHUB_TOKEN not set")
+        return
+    try:
+        p = Path(local_path)
+        if not p.exists():
+            raise FileNotFoundError(f"Cannot upload — file not found: {local_path}")
+        size_kb = p.stat().st_size / 1024
+        is_image = filename.lower().endswith((".jpg",".jpeg",".png"))
+        if is_image and size_kb < 30:
+            raise ValueError(f"Image too small ({size_kb:.1f}KB) — aborting: {filename}")
+        if not is_image and size_kb == 0:
+            raise ValueError(f"Text file is empty — aborting: {filename}")
+        data = p.read_bytes()  # read into memory first, same as Dropbox path
+        content_b64 = base64.b64encode(data).decode("ascii")
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FOLDER}/{filename}"
+        headers = {
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        # Check if file already exists at this path — GitHub's Contents API
+        # requires the current blob SHA to overwrite an existing file,
+        # otherwise it 409s. A fresh filename (no prior SHA) creates new.
+        existing_sha = None
+        get_resp = requests.get(api_url, headers=headers, params={"ref": GITHUB_BRANCH}, timeout=15)
+        if get_resp.status_code == 200:
+            existing_sha = get_resp.json().get("sha")
+        payload = {
+            "message": f"Update {filename} ({size_kb:.0f}KB)",
+            "content": content_b64,
+            "branch": GITHUB_BRANCH,
+        }
+        if existing_sha:
+            payload["sha"] = existing_sha
+        put_resp = requests.put(api_url, headers=headers, json=payload, timeout=30)
+        if put_resp.status_code not in (200, 201):
+            raise RuntimeError(f"GitHub API {put_resp.status_code}: {put_resp.text[:300]}")
+        raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/{GITHUB_FOLDER}/{filename}"
+        log.info(f"Backed up → GitHub:{raw_url} ({size_kb:.0f}KB)")
+    except Exception as e:
+        # Backup failing is NOT fatal — direct-serve is the real posting path now.
+        log.warning(f"GitHub backup failed for {filename} (non-fatal, archive only): {e}")
+
+def save_caption_file(caption, base_name):
+    """Write and back up a caption file. Hardened against ever producing an
+    empty .txt — a blank caption is worse than a generic one, since it gives
+    Julia nothing to post at all. If `caption` is somehow empty/None despite
+    upstream fallbacks (seen once after a Claude API 400 — root cause not
+    fully isolated, so this is a deliberate last line of defense rather than
+    a fix for a specific known bug), substitute a clearly-marked placeholder
+    so it's obvious at a glance the real caption needs a manual rewrite,
+    instead of silently uploading nothing."""
+    if not caption or not caption.strip():
+        log.error(f"save_caption_file: caption was empty for {base_name} — writing placeholder instead of a blank file")
+        caption = (f"[CAPTION GENERATION FAILED — replace this before posting]\n\n"
+                   f"{base_name.replace('_',' ')}")
+    p = TMP_DIR / f"{base_name}.txt"
+    p.write_text(caption, encoding="utf-8")
+    if p.stat().st_size == 0:
+        log.error(f"save_caption_file: file still 0 bytes after write for {base_name} — skipping upload")
+        return
+    upload_dropbox(str(p), f"{base_name}.txt")
+    upload_github(str(p), f"{base_name}.txt")
+
+# ── State ─────────────────────────────────────────────────────────────────────
+def load_posted():
+    if POSTED_FILE.exists():
+        return set(json.loads(POSTED_FILE.read_text()))
+    try:
+        dbx = dropbox.Dropbox(
+            oauth2_refresh_token=DBX_TOKEN,
+            app_key=os.environ.get("DROPBOX_APP_KEY","gmao4qdft812tm6"),
+            app_secret=os.environ.get("DROPBOX_APP_SECRET","c0xopjcwq0ty2y7")
+        )
+        _, res = dbx.files_download(f"{DBX_FOLDER}/.posted.json")
+        data = set(json.loads(res.content))
+        POSTED_FILE.write_text(json.dumps(list(data)))
+        log.info(f"Restored posted.json from Dropbox ({len(data)} entries)")
+        return data
+    except Exception:
+        return set()
+
+def save_posted(posted):
+    POSTED_FILE.write_text(json.dumps(list(posted)))
+    try:
+        dbx = dropbox.Dropbox(
+            oauth2_refresh_token=DBX_TOKEN,
+            app_key=os.environ.get("DROPBOX_APP_KEY","gmao4qdft812tm6"),
+            app_secret=os.environ.get("DROPBOX_APP_SECRET","c0xopjcwq0ty2y7")
+        )
+        dbx.files_upload(
+            json.dumps(list(posted)).encode(),
+            f"{DBX_FOLDER}/.posted.json",
+            mode=dropbox.files.WriteMode.overwrite
+        )
+    except Exception as e:
+        log.warning(f"Could not backup posted.json: {e}")
+
+def schedule_done_today():
+    return (TMP_DIR / f"sched_{et_today().replace('-','')}.done").exists()
+
+def mark_schedule_done():
+    (TMP_DIR / f"sched_{et_today().replace('-','')}.done").touch()
+
+# ── Font download ─────────────────────────────────────────────────────────────
+def download_fonts():
+    fonts = {
+        BEBAS:     "https://github.com/google/fonts/raw/main/ofl/bebasneue/BebasNeue-Regular.ttf",
+        POPPINS_B: "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Bold.ttf",
+        POPPINS_M: "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Medium.ttf",
+        POPPINS_R: "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Regular.ttf",
+    }
+    for path, url in fonts.items():
+        if not Path(path).exists():
+            log.info(f"Downloading font: {Path(path).name}")
+            Path(path).write_bytes(requests.get(url, timeout=30).content)
+    log.info("Fonts ready")
+
+# ── Graphic generators ────────────────────────────────────────────────────────
+def lf(path, size):
+    try: return ImageFont.truetype(path, size)
+    except: return ImageFont.load_default()
+
+def hr(h): h=h.lstrip("#"); return tuple(int(h[i:i+2],16) for i in (0,2,4))
+def darken(h,f=0.62): r,g,b=hr(h); return (int(r*f),int(g*f),int(b*f))
+
+TEAM_COLORS = {
+    "argentina":"#74ACDF","brazil":"#009C3B","france":"#002395","england":"#CF142B",
+    "spain":"#AA151B","germany":"#222222","portugal":"#006600","united states":"#B22234",
+    "usa":"#B22234","mexico":"#006847","canada":"#D80621","morocco":"#C1272D",
+    "japan":"#BC002D","netherlands":"#E77728","uruguay":"#5EB6E4","senegal":"#00853F",
+    "croatia":"#D4263D","colombia":"#C8A84B","nigeria":"#008751","australia":"#C8A84B",
+    "türkiye":"#E30A17","turkey":"#E30A17","south korea":"#CD2E3A","iran":"#239F40",
+    "poland":"#DC143C","ecuador":"#C8A84B","paraguay":"#D52B1E","czechia":"#D7141A",
+    "switzerland":"#D52B1E","denmark":"#C60C30","serbia":"#C6363C",
+    "south africa":"#007A4D","saudi arabia":"#006C35","ghana":"#006B3F",
+}
+PITCH_DARK=(34,80,18); PITCH_MID=(44,100,24); PITCH_EDGE=(22,55,10)
+
+def get_accent(name):
+    n = name.lower()
+    for k,v in TEAM_COLORS.items():
+        if k in n: return v
+    return "#1a5c2a"
+
+def centered(d,text,font,y,W,color,shadow=None):
+    bb=d.textbbox((0,0),text,font=font); w=bb[2]-bb[0]; x=(W-w)//2
+    if shadow: d.text((x+3,y+3),text,font=font,fill=shadow)
+    d.text((x,y),text,font=font,fill=color)
+
+def col_text(d,text,font,y,cx,color):
+    bb=d.textbbox((0,0),text,font=font); w=bb[2]-bb[0]
+    d.text((cx-w//2,y),text,font=font,fill=color)
+
+def wrap_text(d,text,font,max_w):
+    words=text.split(); lines=[]; line=[]
+    for w in words:
+        if d.textbbox((0,0)," ".join(line+[w]),font=font)[2]>max_w:
+            if line: lines.append(" ".join(line))
+            line=[w]
+        else: line.append(w)
+    if line: lines.append(" ".join(line))
+    return lines
+
+def draw_pitch(d,S,top_h):
+    sw=54
+    for x in range(0,S,sw*2):
+        d.rectangle([x,0,min(x+sw,S),top_h],fill=PITCH_DARK)
+        d.rectangle([min(x+sw,S),0,min(x+sw*2,S),top_h],fill=PITCH_MID)
+    for i in range(22): d.rectangle([i,i,S-i,top_h-i],outline=(0,0,0,int(80*(1-i/22))),width=1)
+    cxp,cyp,r=S//2,int(top_h*0.52),175
+    for t in range(3): d.ellipse([cxp-r+t,cyp-r+t,cxp+r-t,cyp+r-t],outline=(255,255,255,25),width=1)
+    d.ellipse([cxp-4,cyp-4,cxp+4,cyp+4],fill=(255,255,255,40))
+
+def safe_save(img, output_path, min_kb=30):
+    """Save image as JPEG (guaranteed large file) to temp, validate, then move.
+    JPEG at quality=95 always produces 50KB+ for 1080x1080 graphics.
+    PNG compresses solid-color images to <20KB which Instagram rejects."""
+    # Force .jpg extension — Instagram accepts JPEG fine
+    out_path = Path(str(output_path).replace(".png", ".jpg"))
+    tmp = Path(str(out_path) + ".tmp")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Convert to RGB if needed (JPEG doesn't support alpha)
+    save_img = img.convert("RGB") if img.mode != "RGB" else img
+    save_img.save(str(tmp), "JPEG", quality=95, optimize=True)
+    size_kb = tmp.stat().st_size / 1024
+    if size_kb < min_kb:
+        tmp.unlink(missing_ok=True)
+        raise ValueError(f"Image too small ({size_kb:.1f}KB < {min_kb}KB) — aborting upload")
+    tmp.rename(out_path)
+    log.info(f"Saved {out_path.name} ({size_kb:.0f}KB)")
+    return str(out_path)
+
+def make_result_card(home,away,hs,as_,stage,venue,insight,date_str,output_path):
+    S=1080; SPLIT=555; W=(255,255,255); INK=(12,12,22)
+    img=Image.new("RGB",(S,S),"#FFFFFF"); d=ImageDraw.Draw(img)
+    won=home if hs>as_ else (away if as_>hs else None)
+    ax=get_accent(won) if won else "#1a5c2a"; ac=hr(ax); adk=darken(ax)
+    draw_pitch(d,S,SPLIT)
+    d.rectangle([0,SPLIT,S,S],fill=(252,252,252))
+    d.rectangle([0,SPLIT,S,SPLIT+8],fill=ac)
+    f_stg=lf(POPPINS_B,26); f_tm=lf(BEBAS,96); f_sc=lf(BEBAS,260)
+    f_bdg=lf(POPPINS_B,29); f_ins=lf(POPPINS_B,37); f_ven=lf(POPPINS_R,23); f_br=lf(POPPINS_B,21)
+    centered(d,stage.upper(),f_stg,28,S,(205,230,205))
+    badge=f"{home.upper()} WIN" if hs>as_ else (f"{away.upper()} WIN" if as_>hs else "DRAW")
+    bb=d.textbbox((0,0),badge,font=f_bdg); bw=bb[2]-bb[0]+44; bx=(S-bw)//2
+    d.rounded_rectangle([bx,68,bx+bw,112],radius=7,fill=ac)
+    centered(d,badge,f_bdg,76,S,W)
+    HL,HR=S//4,S*3//4; ty=130
+    for name,ccx in [(home.upper(),HL),(away.upper(),HR)]:
+        nbb=d.textbbox((0,0),name,font=f_tm); nw=nbb[2]-nbb[0]
+        d.text((ccx-nw//2+3,ty+3),name,font=f_tm,fill=(0,0,0,90))
+        d.text((ccx-nw//2,ty),name,font=f_tm,fill=W)
+    for ccx in [HL,HR]: d.rectangle([ccx-26,ty+98,ccx+26,ty+103],fill=ac)
+    sc=f"{hs}  –  {as_}"
+    scbb=d.textbbox((0,0),sc,font=f_sc); scw=scbb[2]-scbb[0]; scx=(S-scw)//2
+    scy=int(SPLIT*0.52)-(scbb[3]-scbb[1])//2+20
+    d.text((scx+5,scy+5),sc,font=f_sc,fill=(0,0,0,100))
+    d.text((scx,scy),sc,font=f_sc,fill=W)
+    lines=wrap_text(d,insight,f_ins,S-100); iy=SPLIT+28
+    for i,ln in enumerate(lines[:3]): centered(d,ln,f_ins,iy+i*52,S,INK)
+    iy_end=iy+len(lines[:3])*52
+    vy=max(iy_end+30,870)
+    centered(d,venue.upper(),f_ven,vy,S,(145,145,152))
+    centered(d,date_str,f_ven,vy+32,S,(160,160,168))
+    d.rectangle([0,S-62,S,S],fill=PITCH_DARK); d.rectangle([0,S-62,S,S-58],fill=PITCH_EDGE)
+    centered(d,"WORLD CUP IN 5  ·  2026",f_br,S-44,S,W)
+    return safe_save(img, output_path)
+
+def make_schedule_card(matches,date_str,day_num,output_path):
+    S=1080; img=Image.new("RGB",(S,S),"#FFFFFF"); d=ImageDraw.Draw(img)
+    NAVY=(10,18,45); GOLD=(212,168,75); GOLD_LT=(240,215,140); GOLD_DK=(160,122,40)
+    OFF_W=(252,250,245); MID=(28,42,80); MUTED=(120,130,155); W=(255,255,255)
+    HH=292
+    d.rectangle([0,0,S,HH],fill=NAVY)
+    for i in range(0,80,8): d.line([(0,180+i),(120+i,60)],fill=(30,48,100),width=1)
+    d.rectangle([0,HH,S,HH+10],fill=GOLD); d.rectangle([0,HH+10,S,S],fill=OFF_W)
+    f_ey=lf(POPPINS_B,22); f_dy=lf(BEBAS,130); f_dt=lf(POPPINS_B,32)
+    f_sh=lf(POPPINS_M,22); f_br=lf(POPPINS_B,20)
+    centered(d,"2026 FIFA WORLD CUP  ·  TODAY'S MATCHES",f_ey,28,S,GOLD)
+    centered(d,f"DAY {day_num}",f_dy,52,S,W)
+    centered(d,date_str.upper(),f_dt,186,S,GOLD_LT)
+    mc=f"{len(matches)} MATCH{'ES' if len(matches)!=1 else ''} TODAY"
+    mcbb=d.textbbox((0,0),mc,font=f_sh); mcw=mcbb[2]-mcbb[0]+38; mcx=(S-mcw)//2
+    d.rounded_rectangle([mcx,234,mcx+mcw,274],radius=6,fill=MID)
+    centered(d,mc,f_sh,240,S,GOLD_LT)
+    n=len(matches); pad_x=48; FOOTER=62
+    body_top=HH+10; body_bot=S-FOOTER
+    row_h=(body_bot-body_top-20)//n; start_y=body_top+10
+    if row_h>=180:   tf=lf(BEBAS,80); tif=lf(POPPINS_B,30); gf=lf(POPPINS_M,23)
+    elif row_h>=130: tf=lf(BEBAS,64); tif=lf(POPPINS_B,26); gf=lf(POPPINS_M,20)
+    elif row_h>=100: tf=lf(BEBAS,52); tif=lf(POPPINS_B,22); gf=lf(POPPINS_M,17)
+    else:            tf=lf(BEBAS,44); tif=lf(POPPINS_B,18); gf=lf(POPPINS_M,15)
+    for i,m in enumerate(matches):
+        y=start_y+i*row_h; ym=y+row_h//2
+        d.rectangle([pad_x,y+4,S-pad_x,y+row_h-4],fill=(244,242,238) if i%2==0 else W)
+        d.rectangle([pad_x,y+4,pad_x+5,y+row_h-4],fill=GOLD)
+        tb=d.textbbox((0,0),m["time"],font=tif); th=tb[3]-tb[1]
+        d.text((pad_x+18,ym-th//2-8),m["time"],font=tif,fill=NAVY)
+        if m.get("group"): d.text((pad_x+18,ym+6),m["group"],font=gf,fill=MUTED)
+        tc=(pad_x+190+(S-pad_x))//2
+        hu=m["home"].upper(); au=m["away"].upper()
+        hb=d.textbbox((0,0),hu,font=tf); hw=hb[2]-hb[0]
+        ab=d.textbbox((0,0),au,font=tf); aw=ab[2]-ab[0]
+        vb=d.textbbox((0,0),"vs",font=gf); vw=vb[2]-vb[0]
+        g2=16; tw=hw+g2+vw+g2+aw; tx=tc-tw//2; ty2=ym-(hb[3]-hb[1])//2-4
+        # Scale down font if combined team names are too wide
+        max_team_w = S - pad_x - tc - 20
+        while tw > (S - pad_x*2 - 200) and tf.size > 28:
+            tf = lf(BEBAS, tf.size - 4)
+            hb=d.textbbox((0,0),hu,font=tf); hw=hb[2]-hb[0]
+            ab=d.textbbox((0,0),au,font=tf); aw=ab[2]-ab[0]
+            tw=hw+g2+vw+g2+aw; tx=tc-tw//2; ty2=ym-(hb[3]-hb[1])//2-4
+        d.text((tx,ty2),hu,font=tf,fill=NAVY)
+        d.text((tx+hw+g2,ym-(vb[3]-vb[1])//2),"vs",font=gf,fill=MUTED)
+        d.text((tx+hw+g2+vw+g2,ty2),au,font=tf,fill=NAVY)
+        if i<n-1: d.rectangle([pad_x+5,y+row_h-1,S-pad_x,y+row_h],fill=(220,218,212))
+    d.rectangle([0,S-FOOTER,S,S],fill=NAVY); d.rectangle([0,S-FOOTER,S,S-FOOTER+4],fill=GOLD_DK)
+    centered(d,"WORLD CUP IN 5  ·  2026  ·  ALL TIMES ET",f_br,S-42,S,W)
+    return safe_save(img, output_path)
+
+# ── Core jobs ─────────────────────────────────────────────────────────────────
+def job_result_and_recap():
+    """Run result cards, then recap + tomorrow content when all games done."""
+    job_result_cards()
+    job_recap_card()        # self-gates until all games finished
+    job_tomorrow_content()  # self-gates until recap done
+
+def job_result_cards():
+    try:
+        posted = load_posted()
+        log.info("Polling for results...")
+
+        # Fetch matches — log raw API response size
+        all_recent = get_recent_unposted_matches()
+        log.info(f"API returned {len(all_recent)} total matches (today+yesterday ET)")
+
+        # Log status of each match
+        for m in all_recent:
+            hs = m["score"]["fullTime"]["home"]
+            as_ = m["score"]["fullTime"]["away"]
+            mid = str(m["id"])
+            already = mid in posted
+            log.info(f"  Match {mid}: {m['homeTeam']['name']} vs {m['awayTeam']['name']} "
+                    f"status={m['status']} score={hs}-{as_} already_posted={already}")
+
+        finished = [m for m in all_recent
+                   if m["status"] in ("FINISHED","FULL_TIME")
+                   and m["score"]["fullTime"]["home"] is not None]
+
+        # Also catch matches that just ended but API hasn't flipped to FINISHED yet.
+        # IMPORTANT: PAUSED status can mean a genuine weather/safety suspension that
+        # restarts later (not actually finished) — so PAUSED gets a much longer grace
+        # period than IN_PLAY before we assume it is over, to avoid posting a card
+        # for a match that is still going to resume and change the score.
+        just_ended = []
+        for m in all_recent:
+            try:
+                status = m["status"]
+                if status in ("IN_PLAY","PAUSED","EXTRA_TIME"):
+                    ft = m.get("score",{}).get("fullTime",{})
+                    if ft.get("home") is not None:
+                        kickoff_et = utc_to_et(m["utcDate"])
+                        mins_since_kickoff = (et_now() - kickoff_et).total_seconds() / 60
+                        # PAUSED (weather/safety delay) needs much longer before we
+                        # treat it as finished — delays can run 1-2+ hours legitimately
+                        threshold = 240 if status == "PAUSED" else 110
+                        if mins_since_kickoff > threshold:
+                            log.info(f"Treating {m['homeTeam']['name']} vs {m['awayTeam']['name']} as finished (status={status}, {mins_since_kickoff:.0f} mins elapsed, threshold={threshold})")
+                            just_ended.append(m)
+                        else:
+                            log.debug(f"{m['homeTeam']['name']} vs {m['awayTeam']['name']} still {status} ({mins_since_kickoff:.0f}/{threshold} mins) — not yet treating as finished")
+            except Exception as e:
+                log.warning(f"just_ended check error for match {m.get('id','??')}: {e}")
+
+        all_finished = finished + [m for m in just_ended if m not in finished]
+        new = [m for m in all_finished if str(m["id"]) not in posted]
+        log.info(f"Poll: {len(all_recent)} total, {len(all_finished)} finished, {len(new)} new to post")
+        if not new: log.info(f"Poll: {len(all_finished)} finished, 0 new"); return
+        for match in new:  # new = unposted finished matches
+            mid   = str(match["id"])
+            home  = match["homeTeam"]["name"]
+            away  = match["awayTeam"]["name"]
+            hs    = match["score"]["fullTime"]["home"]
+            as_   = match["score"]["fullTime"]["away"]
+            stage = match_stage_label(match)
+            venue = match.get("venue","") or ""
+            today = et_now().strftime("%B %-d, %Y")
+            log.info(f"New result: {home} {hs}–{as_} {away}")
+            try:
+                insight   = claude_insight(home, away, hs, as_, stage)
+                hashtags  = build_hashtag_block(home, away, stage)
+                caption   = claude_result_caption(home, away, hs, as_, stage, insight, hashtags)
+                log.info(f"Insight: {insight}")
+                safe = f"{home.replace(' ','_')}_vs_{away.replace(' ','_')}_{mid}"
+                img_path = str(TMP_DIR / f"{safe}.png")
+                img_path = make_result_card(home, away, hs, as_, stage, venue, insight, today, img_path)
+                fname_out = Path(img_path).name
+                fname_stem = Path(img_path).stem
+                # register_card re-verifies the file on disk RIGHT NOW — this is
+                # the actual posting path. Dropbox/GitHub below are backups only.
+                register_card(img_path, "result", caption)
+                upload_dropbox(img_path, fname_out)
+                upload_github(img_path, fname_out)
+                save_caption_file(caption, fname_stem)
+                posted.add(mid); save_posted(posted)
+                log.info(f"Posted: {safe}")
+            except Exception as card_err:
+                # Do NOT mark this match as posted if generation/upload failed —
+                # this lets the next poll retry it instead of silently skipping forever
+                log.error(f"Failed to generate/upload card for {home} vs {away} (mid={mid}): {card_err}", exc_info=True)
+                continue
+    except Exception as e:
+        log.error(f"Result job error: {e}", exc_info=True)
+
+def job_schedule_card():
+    try:
+        if schedule_done_today(): return
+        matches_raw = get_todays_matches()
+        if not matches_raw:
+            log.info("No matches today"); mark_schedule_done(); return
+        today_et  = et_now()
+        date_str  = today_et.strftime("%A, %B %-d")
+        dn        = day_number()
+        matches   = []
+        for m in sorted(matches_raw, key=lambda x: x["utcDate"]):
+            group = (m.get("group","") or "").replace("GROUP_","Group ")
+            stage = m.get("stage","").replace("_"," ").title()
+            matches.append({"time":format_kickoff_et(m["utcDate"]),"home":m["homeTeam"]["name"],
+                            "away":m["awayTeam"]["name"],"group":group,"stage":stage})
+        log.info(f"Schedule: Day {dn} · {date_str} · {len(matches)} matches")
+        img_path   = str(TMP_DIR / f"schedule_{et_today().replace('-','')}.png")
+        img_path   = make_schedule_card(matches, date_str, dn, img_path)
+        hashtags   = build_hashtag_block("", "", "group stage")
+        caption    = claude_schedule_caption(matches, date_str, dn, hashtags)
+        fname      = Path(img_path).stem
+        register_card(img_path, "schedule", caption)
+        upload_dropbox(img_path, Path(img_path).name)
+        upload_github(img_path, Path(img_path).name)
+        save_caption_file(caption, fname)
+        mark_schedule_done()
+        log.info(f"Schedule posted: {date_str}")
+    except Exception as e:
+        log.error(f"Schedule job error: {e}", exc_info=True)
+
+
+
+# ── Recap card generator ──────────────────────────────────────────────────────
+def make_recap_card(day_num, date_str, results, standings, scorers, stat_hero, output_path):
+    import math
+    S=1080
+    BEBAS_F=BEBAS; PB=POPPINS_B; PM=POPPINS_M
+
+    def lfr(p,s):
+        try: return ImageFont.truetype(p,s)
+        except: return ImageFont.load_default()
+
+    def cxr(d,text,font,y,W,color):
+        bb=d.textbbox((0,0),text,font=font); w=bb[2]-bb[0]
+        d.text(((W-w)//2,y),text,font=font,fill=color)
+
+    def sec_hdr(d,text,y,S,color=(212,168,75)):
+        f=lfr(PB,14); bb=d.textbbox((0,0),text,font=f); w=bb[2]-bb[0]
+        cx_pos=(S-w)//2
+        d.rectangle([36,y+9,cx_pos-10,y+10],fill=(30,48,80))
+        d.rectangle([cx_pos+w+10,y+9,S-36,y+10],fill=(30,48,80))
+        d.text((cx_pos,y),text,font=f,fill=color); return y+22
+
+    GOLD=(212,168,75); GOLD_DK=(160,122,40); NAVY=(10,18,45)
+    WHITE=(255,255,255); MUTED=(90,110,140); ACCENT=(79,195,247)
+    OFF_W=(220,228,240); GREEN=(100,210,100)
+
+    # estimate height
+    H=max(82+22+len(results)*60+8+22+18+len(standings[0]['teams'])*19+14+22+116+22+96+62, 700)
+    img=Image.new("RGB",(S,H),(8,14,35)); d=ImageDraw.Draw(img)
+    for r in range(max(S,H)//2,0,-3):
+        t=r/(max(S,H)//2)
+        d.ellipse([S//2-r,H//2-r,S//2+r,H//2+r],
+                  fill=(int(8+(1-t)*5),int(14+(1-t)*12),int(35+(1-t)*10)))
+
+    PAD=36
+    d.rectangle([0,0,S,80],fill=(12,20,50))
+    d.rectangle([0,78,S,82],fill=GOLD)
+    cxr(d,"2026 FIFA WORLD CUP  ·  END OF DAY RECAP",lfr(PB,18),12,S,GOLD)
+    cxr(d,f"DAY {day_num}  ·  {date_str.upper()}",lfr(PB,24),40,S,WHITE)
+    y=96
+
+    # Results
+    y=sec_hdr(d,"TODAY'S RESULTS",y,S)
+    f_res=lfr(BEBAS_F,48); f_score=lfr(BEBAS_F,56)
+    for r in results:
+        rh=54; ry=y
+        d.rounded_rectangle([PAD,ry,S-PAD,ry+rh],radius=8,fill=(18,28,58))
+        hw=r['home'].upper(); aw=r['away'].upper(); sc=r['score']
+        hbb=d.textbbox((0,0),hw,font=f_res); hw_w=hbb[2]-hbb[0]
+        abb=d.textbbox((0,0),aw,font=f_res); aw_w=abb[2]-abb[0]
+        scbb=d.textbbox((0,0),sc,font=f_score); sc_w=scbb[2]-scbb[0]
+        home_x=S//2-sc_w//2-24-hw_w; away_x=S//2+sc_w//2+24; score_x=(S-sc_w)//2
+        home_col=WHITE if r.get('winner')==r['home'] else MUTED
+        away_col=WHITE if r.get('winner')==r['away'] else MUTED
+        score_col=GOLD if r.get('winner') else ACCENT
+        d.text((home_x,ry+4),hw,font=f_res,fill=home_col)
+        d.text((score_x,ry-2),sc,font=f_score,fill=score_col)
+        d.text((away_x,ry+4),aw,font=f_res,fill=away_col)
+        if r.get('winner'):
+            bx=home_x-28 if r['winner']==r['home'] else away_x+aw_w+6
+            d.rounded_rectangle([bx,ry+14,bx+22,ry+36],radius=4,fill=(60,180,80))
+            d.text((bx+5,ry+17),"W",font=lfr(PB,12),fill=WHITE)
+        y+=rh+6
+    y+=8
+
+    # Standings
+    y=sec_hdr(d,"GROUP STANDINGS",y,S)
+    n=len(standings); cols=min(n,4); col_w=(S-PAD*2)//cols
+    f_gt=lfr(PM,14); f_gp=lfr(BEBAS_F,26)
+    max_rows=0
+    for gi,grp in enumerate(standings):
+        col=gi%cols; row_idx=gi//cols
+        gx=PAD+col*col_w
+        gy=y+row_idx*(len(grp['teams'])*19+32)
+        d.text((gx+4,gy),f"GROUP {grp['group']}",font=lfr(PB,15),fill=ACCENT)
+        d.text((gx+col_w-86,gy),"P",font=lfr(PM,11),fill=MUTED)
+        d.text((gx+col_w-58,gy),"GD",font=lfr(PM,11),fill=MUTED)
+        d.text((gx+col_w-26,gy),"PTS",font=lfr(PM,11),fill=MUTED)
+        ty=gy+18
+        for ti,team in enumerate(grp['teams']):
+            if ti<2: d.rectangle([gx+2,ty+2,gx+4,ty+16],fill=GOLD if ti==0 else ACCENT)
+            nc=WHITE if ti<2 else MUTED
+            d.text((gx+8,ty),team['name'][:12],font=f_gt,fill=nc)
+            d.text((gx+col_w-86,ty),str(team.get('played',1)),font=f_gt,fill=MUTED)
+            gd=team.get('gd','+0')
+            gdc=GREEN if gd.startswith('+') else ((220,80,80) if gd.startswith('-') else MUTED)
+            d.text((gx+col_w-58,ty),gd,font=f_gt,fill=gdc)
+            pb=d.textbbox((0,0),str(team['pts']),font=f_gp); pw=pb[2]-pb[0]
+            d.text((gx+col_w-8-pw,ty-4),str(team['pts']),font=f_gp,fill=GOLD if ti==0 else nc)
+            ty+=19; max_rows=max(max_rows,ty-y)
+        if col<cols-1:
+            d.rectangle([gx+col_w-1,gy,gx+col_w,ty],fill=(25,40,75))
+    y+=max_rows+12
+
+    # Scorers
+    y=sec_hdr(d,"GOLDEN BOOT RACE",y,S)
+    sc_cw=(S-PAD*2)//3; rl=["1ST","2ND","3RD"]; rc=[(212,168,75),(160,168,185),(180,100,40)]
+    f_sn=lfr(PB,19); f_ss=lfr(PM,14); f_sg=lfr(BEBAS_F,44)
+    for si,sc in enumerate(scorers[:3]):
+        sx=PAD+si*sc_cw+sc_cw//2
+        rb_w=36; rb_x=sx-rb_w//2
+        d.rounded_rectangle([rb_x,y,rb_x+rb_w,y+20],radius=4,fill=rc[si])
+        rlb=d.textbbox((0,0),rl[si],font=lfr(PB,11)); rw=rlb[2]-rlb[0]
+        d.text((sx-rw//2,y+3),rl[si],font=lfr(PB,11),fill=(10,10,20))
+        gb=d.textbbox((0,0),str(sc['goals']),font=f_sg); gw=gb[2]-gb[0]
+        d.text((sx-gw//2,y+24),str(sc['goals']),font=f_sg,fill=WHITE)
+        nb=d.textbbox((0,0),sc['name'],font=f_sn); nw=nb[2]-nb[0]
+        d.text((sx-nw//2,y+68),sc['name'],font=f_sn,fill=WHITE)
+        tb=d.textbbox((0,0),sc['team'],font=f_ss); tw=tb[2]-tb[0]
+        d.text((sx-tw//2,y+90),sc['team'],font=f_ss,fill=ACCENT)
+    y+=112
+
+    # Player of day
+    y=sec_hdr(d,"PLAYER OF THE DAY",y,S)
+    d.rounded_rectangle([PAD,y,S-PAD,y+84],radius=10,fill=(15,24,52))
+    d.rectangle([PAD,y,PAD+5,y+84],fill=GOLD)
+    cxr(d,stat_hero['name'].upper(),lfr(BEBAS_F,52),y+4,S,WHITE)
+    cxr(d,stat_hero['team'],lfr(PM,16),y+56,S,ACCENT)
+    cxr(d,stat_hero['stat'],lfr(PM,15),y+74,S,OFF_W)
+    y+=96
+
+    # Brand
+    bar_y=y+10
+    d.rectangle([0,bar_y,S,bar_y+48],fill=NAVY)
+    d.rectangle([0,bar_y,S,bar_y+4],fill=GOLD_DK)
+    cxr(d,"WORLD CUP IN 5  ·  2026  ·  @WORLDCUPIN5",lfr(PB,17),bar_y+14,S,WHITE)
+
+    final_h=bar_y+48
+    img=img.crop((0,0,S,final_h))
+    if final_h<S:
+        padded=Image.new("RGB",(S,S),(8,14,35))
+        padded.paste(img,(0,(S-final_h)//2))
+        img=padded
+
+    Path(output_path).parent.mkdir(parents=True,exist_ok=True)
+    return safe_save(img, output_path)
+
+
+def claude_recap_content(day_num, results, scorers_raw, standings_raw):
+    """Ask Claude to pick player of the day and write recap caption."""
+    results_txt = "\n".join([f"{r['home']} {r['score']} {r['away']}" for r in results])
+    scorers_txt = ", ".join([f"{s['name']} ({s['team']}) {s['goals']} goals" for s in scorers_raw[:5]])
+    prompt = (
+        f"World Cup Day {day_num} just ended. Results:\n{results_txt}\n\n"
+        f"Top scorers so far: {scorers_txt}\n\n"
+        f"1. Pick the PLAYER OF THE DAY — one player who stood out most today. "
+        f"Give their name, team, and a ONE line stat/story (max 12 words).\n"
+        f"2. Write an Instagram end-of-day recap caption (max 120 words before hashtags). "
+        f"Punchy, expert tone. End with a CTA to follow @worldcupin5.\n\n"
+        f"Respond in this EXACT JSON format, no markdown:\n"
+        f'{{"player_name":"","player_team":"","player_stat":"","caption":""}}'
+    )
+    result = claude_call(prompt, max_tokens=400)
+    if not result:
+        return None
+    try:
+        import json
+        # strip any accidental markdown
+        clean = result.strip().lstrip('`').rstrip('`')
+        if clean.startswith('json'): clean=clean[4:]
+        return json.loads(clean)
+    except Exception as e:
+        log.error(f"Recap JSON parse error: {e} — raw: {result[:200]}")
+        return None
+
+
+def recap_key():
+    """Use day number as recap key — stable across midnight ET boundary."""
+    return f"recap_day{day_number()}"
+
+def recap_done_today():
+    return (TMP_DIR / f"{recap_key()}.done").exists()
+
+def mark_recap_done():
+    (TMP_DIR / f"{recap_key()}.done").touch()
+
+
+def job_recap_card():
+    """Generate end-of-day recap card — only after ALL of today's matches are finished.
+    Fetches today AND tomorrow ET to catch midnight games that cross the date boundary."""
+    try:
+        if recap_done_today(): return
+
+        today_et  = et_now()
+        dn        = day_number()
+        hour_et   = today_et.hour
+
+        # KEY INSIGHT: recap runs at/after midnight ET.
+        # At midnight ET, et_today() = new day, but the games we want to recap
+        # are from YESTERDAY ET. So if hour < 6, look at yesterday's matches.
+        # If hour >= 6, look at today's matches (recap fires after all games done).
+        if hour_et < 6:
+            # After midnight — recap covers yesterday ET's games
+            primary_str  = (today_et - timedelta(days=1)).strftime("%Y-%m-%d")
+            overflow_str = et_today()  # midnight games fall on today ET
+            date_str     = (today_et - timedelta(days=1)).strftime("%A, %B %-d")
+        else:
+            # Before midnight — recap covers today ET's games
+            primary_str  = et_today()
+            overflow_str = (today_et + timedelta(days=1)).strftime("%Y-%m-%d")
+            date_str     = today_et.strftime("%A, %B %-d")
+
+        all_primary  = get_matches_for_et_date(primary_str)
+        all_overflow = get_matches_for_et_date(overflow_str)
+
+        # Include overflow games that kick off between midnight and 3am ET
+        # These belong to the primary broadcast day (e.g. Austria vs Jordan at 12am ET)
+        midnight_games = [m for m in all_overflow
+                         if utc_to_et(m["utcDate"]).hour < 3]
+
+        all_day = all_primary + midnight_games
+
+        if not all_day:
+            log.info(f"Recap job: no matches found for {primary_str} ET, skipping")
+            mark_recap_done(); return
+
+        log.info(f"Recap covering {primary_str} ET ({len(all_primary)} matches) + {len(midnight_games)} midnight games = {len(all_day)} total")
+
+        finished = [m for m in all_day if m["status"] in ("FINISHED","FULL_TIME")]
+        pending  = [m for m in all_day if m["status"] not in ("FINISHED","FULL_TIME")]
+
+        # Also count just-ended games (status not updated yet but 110+ mins elapsed)
+        just_ended = []
+        for m in pending:
+            if m["score"]["fullTime"]["home"] is not None:
+                kickoff_et = utc_to_et(m["utcDate"])
+                mins = (et_now() - kickoff_et).total_seconds() / 60
+                if mins > 110:
+                    just_ended.append(m)
+                    log.info(f"Recap: counting {m['homeTeam']['name']} vs {m['awayTeam']['name']} as finished ({mins:.0f} mins elapsed)")
+
+        truly_pending = [m for m in pending if m not in just_ended]
+        all_finished  = finished + just_ended
+
+        if not all_finished:
+            log.info("Recap job: no finished matches yet, skipping")
+            return
+
+        if truly_pending:
+            names = [f"{m['homeTeam']['name']} vs {m['awayTeam']['name']}" for m in truly_pending]
+            log.info(f"Recap job: {len(truly_pending)} still pending — waiting: {names}")
+            return
+
+        log.info(f"Recap job: all {len(all_finished)} matches done — generating recap")
+        finished = all_finished  # use combined list for recap generation
+
+        # Build results list
+        results = []
+        for m in finished:
+            hs = m["score"]["fullTime"]["home"]
+            as_ = m["score"]["fullTime"]["away"]
+            home = m["homeTeam"]["name"]; away = m["awayTeam"]["name"]
+            winner = home if hs > as_ else (away if as_ > hs else None)
+            results.append({"home": home, "away": away,
+                           "score": f"{hs}–{as_}", "winner": winner})
+
+        # Get standings
+        try:
+            standings_data = fd_get(f"/competitions/WC/standings")
+            raw_standings = standings_data.get("standings", [])
+            standings = []
+            for grp in raw_standings[:6]:  # max 6 groups on any day
+                group_letter = grp.get("group","").replace("GROUP_","")
+                if not group_letter: continue
+                teams = []
+                for row in grp.get("table", [])[:4]:
+                    gd = row.get("goalDifference", 0)
+                    teams.append({
+                        "name": row["team"]["shortName"] or row["team"]["name"],
+                        "pts":  row["points"],
+                        "played": row["playedGames"],
+                        "gd": f"+{gd}" if gd > 0 else str(gd)
+                    })
+                if teams:
+                    standings.append({"group": group_letter, "teams": teams})
+        except Exception as e:
+            log.warning(f"Standings fetch failed: {e}")
+            standings = [{"group":"?","teams":[{"name":"See standings","pts":0,"played":0,"gd":"0"}]}]
+
+        # Get top scorers
+        try:
+            scorers_data = fd_get("/competitions/WC/scorers?limit=10")
+            scorers_raw = [{"name": s["player"]["name"],
+                           "team": s["team"]["shortName"] or s["team"]["name"],
+                           "goals": s["goals"]}
+                          for s in scorers_data.get("scorers", [])]
+        except Exception as e:
+            log.warning(f"Scorers fetch failed: {e}")
+            scorers_raw = [{"name":"See golden boot","team":"","goals":0}]
+
+        # Get Claude to pick player of day + write caption
+        ai = claude_recap_content(dn, results, scorers_raw, standings)
+        if ai:
+            stat_hero = {"name": ai["player_name"],
+                        "team": ai["player_team"],
+                        "stat": ai["player_stat"]}
+            caption_text = ai["caption"]
+        else:
+            # fallback
+            stat_hero = {"name": results[0]['home'] if results else "—",
+                        "team": "World Cup 2026",
+                        "stat": "Standout performance today"}
+            caption_text = f"Day {dn} is done. Follow @worldcupin5 for every result."
+
+        # Build scorers for card (top 3)
+        scorers_card = scorers_raw[:3] if scorers_raw else [
+            {"name":"Golden Boot","team":"TBD","goals":0}]
+
+        # Generate card — named by primary date (the actual game day, not midnight ET)
+        recap_fname = f"RECAP_{primary_str.replace('-','')}_Day{dn}"
+        img_path = str(TMP_DIR / f"{recap_fname}.png")
+        img_path = make_recap_card(dn, date_str, results, standings, scorers_card, stat_hero, img_path)
+
+        # Build full caption with hashtags
+        hashtags = build_hashtag_block("","","group stage")
+        full_caption = f"{caption_text}\n\n{hashtags}"
+
+        register_card(img_path, "recap", full_caption)
+        upload_dropbox(img_path, Path(img_path).name)
+        upload_github(img_path, Path(img_path).name)
+        save_caption_file(full_caption, Path(img_path).stem)
+        mark_recap_done()
+        log.info(f"Recap card posted for {date_str}")
+
+    except Exception as e:
+        log.error(f"Recap job error: {e}", exc_info=True)
+
+# ── Tomorrow's content generator ─────────────────────────────────────────────
+def recapped_day_number():
+    """The day_number of the broadcast day that job_recap_card most recently
+    covers, mirroring its own hour<6 'yesterday' logic. Used so tomorrow_done()
+    and job_tomorrow_content() always agree on which day they mean, even when
+    this runs right after midnight ET."""
+    now_et = et_now()
+    start = TOURNAMENT_START.astimezone(ET).date()
+    if now_et.hour < 6:
+        d = (now_et - timedelta(days=1)).date()
+    else:
+        d = now_et.date()
+    return max(1, (d - start).days + 1)
+
+def tomorrow_key():
+    return f"tomorrow_day{recapped_day_number() + 1}"
+
+def tomorrow_done():
+    return (TMP_DIR / f"{tomorrow_key()}.done").exists()
+
+def mark_tomorrow_done():
+    (TMP_DIR / f"{tomorrow_key()}.done").touch()
+
+def claude_prediction(home, away, group, kickoff):
+    """Ask Claude for a match prediction — returns dict or None."""
+    fmt = ('{"pred_home":0,"pred_away":0,"confidence":"HIGH",'
+           '"key_player":"","key_player_team":"",'
+           '"reason":"one sentence max 20 words",'
+           '"caption":"punchy 80-word Instagram caption ending with follow @worldcupin5"}')
+    prompt = (
+        "Generate a World Cup 2026 AI match prediction for "
+        + home + " vs " + away
+        + ". Group: " + group + ", Kickoff: " + kickoff
+        + "\n\nRespond in EXACT JSON, no markdown:\n" + fmt
+    )
+    result = claude_call(prompt, max_tokens=300)
+    if not result:
+        return None
+    try:
+        clean = result.strip().lstrip("`").rstrip("`")
+        if clean.startswith("json"): clean = clean[4:]
+        return json.loads(clean)
+    except Exception as e:
+        log.error(f"Prediction JSON parse error: {e}")
+        return None
+
+def make_pred_card(home, away, group, venue, kickoff,
+                   ph, pa, kp, kp_team, reason, conf, output_path):
+    """Cyberpunk neon AI prediction card."""
+    from PIL import ImageFilter
+    S=1080
+    img=Image.new("RGB",(S,S),(4,4,14)); d=ImageDraw.Draw(img)
+    CY=(0,255,200); MG=(255,0,180); YL=(255,230,0)
+    GR=(0,255,100); WH=(255,255,255); OR=(255,150,0)
+    CC={"LOW":MG,"MEDIUM":OR,"HIGH":GR}.get(conf,OR)
+
+    def gt(p,s):
+        try: return ImageFont.truetype(p,s)
+        except: return ImageFont.load_default()
+
+    def glow(im,text,font,y,col,gc,centre=True,x=0):
+        W=im.width
+        gl=Image.new("RGBA",(im.width,im.height),(0,0,0,0))
+        gd=ImageDraw.Draw(gl)
+        bb=gd.textbbox((0,0),text,font=font); tw=bb[2]-bb[0]
+        tx=((W-tw)//2) if centre else x
+        for o in [8,5,3]: gd.text((tx,y-bb[1]),text,font=font,fill=(*gc,int(120/o*8)))
+        gl=gl.filter(ImageFilter.GaussianBlur(5))
+        im=im.convert("RGBA"); im.alpha_composite(gl); im=im.convert("RGB")
+        ImageDraw.Draw(im).text((tx,y-bb[1]),text,font=font,fill=col)
+        return im
+
+    def gbox(im,x0,y0,x1,y1,col,w=2):
+        gl=Image.new("RGBA",(im.width,im.height),(0,0,0,0))
+        gd=ImageDraw.Draw(gl)
+        for o in range(10,0,-2): gd.rectangle([x0-o,y0-o,x1+o,y1+o],outline=(*col,int(140/o*10)),width=1)
+        gl=gl.filter(ImageFilter.GaussianBlur(4))
+        im=im.convert("RGBA"); im.alpha_composite(gl); im=im.convert("RGB")
+        ImageDraw.Draw(im).rectangle([x0,y0,x1,y1],outline=col,width=w)
+        return im
+
+    for x in range(0,S,54): d.line([(x,0),(x,S)],fill=(0,50,35),width=1)
+    for y in range(0,S,54): d.line([(0,y),(S,y)],fill=(0,50,35),width=1)
+    for y in range(0,S,3): d.rectangle([0,y,S,y+1],fill=(0,0,0,25))
+    for r in range(480,0,-5):
+        t=r/480; d.ellipse([S//2-r,S//2-r,S//2+r,S//2+r],fill=(0,int(35*(1-t)),int(18*(1-t))))
+
+    d.rectangle([0,0,S,68],fill=(6,6,22)); d.rectangle([0,66,S,70],fill=CY)
+    img=glow(img,"2026 FIFA WORLD CUP  ·  AI MATCH PREDICTION",gt(POPPINS_B,19),16,CY,CY)
+    img=glow(img,group.upper()+"  //  "+kickoff,gt(BEBAS,36),38,YL,YL)
+    bw=280; by=78; bx=(S-bw)//2
+    d=ImageDraw.Draw(img); d.rectangle([bx,by,bx+bw,by+42],fill=(8,4,24))
+    img=gbox(img,bx,by,bx+bw,by+42,MG,2)
+    img=glow(img,"◀  AI PREDICTED  ▶",gt(BEBAS,30),by+8,MG,MG)
+    ty=132
+    for name,ccx_,col in [(home.upper(),S//4,CY),(away.upper(),S*3//4,MG)]:
+        fu=gt(BEBAS,114); d=ImageDraw.Draw(img)
+        nb=d.textbbox((0,0),name,font=fu); nw=nb[2]-nb[0]
+        while nw>S//2-20 and fu.size>48:
+            fu=gt(BEBAS,fu.size-6)
+            nb=d.textbbox((0,0),name,font=fu); nw=nb[2]-nb[0]
+        img=glow(img,name,fu,ty,col,col,centre=False,x=ccx_-nw//2)
+        d=ImageDraw.Draw(img); nh=nb[3]-nb[1]
+        d.rectangle([ccx_-40,ty+nh+2,ccx_+40,ty+nh+6],fill=col)
+    img=glow(img,"VS",gt(POPPINS_B,30),ty+46,(80,80,80),(40,40,40))
+    sc_y=300; sc_h=186; d=ImageDraw.Draw(img)
+    d.rectangle([44,sc_y,S-44,sc_y+sc_h],fill=(6,8,26))
+    img=gbox(img,44,sc_y,S-44,sc_y+sc_h,YL,2)
+    img=glow(img,"PREDICTED  SCORE",gt(POPPINS_B,20),sc_y+10,YL,YL)
+    fsc=gt(BEBAS,140); sc=str(ph)+"  -  "+str(pa); d=ImageDraw.Draw(img)
+    scb=d.textbbox((0,0),sc,font=fsc); scw=scb[2]-scb[0]
+    img=glow(img,sc,fsc,sc_y+42,WH,YL,centre=False,x=(S-scw)//2)
+    cw=340; cy2=sc_y+sc_h+8; cx2=(S-cw)//2; d=ImageDraw.Draw(img)
+    d.rectangle([cx2,cy2,cx2+cw,cy2+52],fill=(6,8,26))
+    img=gbox(img,cx2,cy2,cx2+cw,cy2+52,CC,2)
+    img=glow(img,"CONFIDENCE :  "+conf,gt(BEBAS,38),cy2+10,CC,CC)
+    kp_y=cy2+66; kp_h=112; d=ImageDraw.Draw(img)
+    d.rectangle([44,kp_y,S-44,kp_y+kp_h],fill=(6,8,26))
+    img=gbox(img,44,kp_y,S-44,kp_y+kp_h,GR,2)
+    img=glow(img,"◉  KEY PLAYER  TO  WATCH",gt(POPPINS_B,17),kp_y+10,GR,GR)
+    img=glow(img,kp.upper(),gt(BEBAS,66),kp_y+32,WH,GR)
+    img=glow(img,kp_team.upper(),gt(POPPINS_B,20),kp_y+86,GR,GR)
+    wr_y=kp_y+kp_h+16
+    img=glow(img,"WHY  WE  THINK  SO",gt(POPPINS_B,18),wr_y,CY,CY)
+    wr_y+=28; d=ImageDraw.Draw(img); fr=gt(POPPINS_B,27)
+    words=reason.split(); lines=[]; line=[]
+    for w in words:
+        if d.textbbox((0,0)," ".join(line+[w]),font=fr)[2]>S-80:
+            if line: lines.append(" ".join(line))
+            line=[w]
+        else: line.append(w)
+    if line: lines.append(" ".join(line))
+    for i,ln in enumerate(lines[:3]): img=glow(img,ln,fr,wr_y+i*40,WH,(50,50,50))
+    wr_y+=len(lines[:3])*40+10
+    img=glow(img,venue.upper(),gt(POPPINS_M,17),wr_y+10,(0,200,140),(0,80,60))
+    d=ImageDraw.Draw(img)
+    d.rectangle([0,S-52,S,S],fill=(4,4,14)); d.rectangle([0,S-52,S,S-49],fill=CY)
+    img=glow(img,"WORLD CUP IN 5  ·  2026  ·  @WORLDCUPIN5",gt(POPPINS_B,19),S-36,CY,CY)
+    return safe_save(img, output_path)
+
+def job_tomorrow_content():
+    """Generate next day's schedule + AI predictions — only after recap is done.
+    Computes 'tomorrow' relative to the broadcast day just recapped, NOT the
+    current wall-clock et_now() — otherwise running after midnight ET causes
+    this to skip an extra day (e.g. recap runs at 12:40am Tue covering Monday,
+    but et_now()+1day would wrongly be Wednesday instead of Tuesday)."""
+    try:
+        if tomorrow_done(): return
+        if not recap_done_today():
+            log.debug("Tomorrow content waiting for recap to complete first")
+            return
+
+        # Use the SAME recapped-day reference as tomorrow_key() so the date
+        # computed here always matches the done-marker that gated this job.
+        now_et = et_now()
+        if now_et.hour < 6:
+            recapped_day_et = (now_et - timedelta(days=1))
+        else:
+            recapped_day_et = now_et
+
+        tomorrow_et = recapped_day_et + timedelta(days=1)
+        tomorrow_str = tomorrow_et.strftime("%Y-%m-%d")
+        date_str = tomorrow_et.strftime("%A, %B %-d")
+        dn = recapped_day_number() + 1
+        matches_raw = get_matches_for_et_date(tomorrow_str)
+        if not matches_raw:
+            log.info("No matches tomorrow — skipping tomorrow content")
+            mark_tomorrow_done(); return
+        log.info("Generating tomorrow content: " + str(len(matches_raw)) + " matches on " + date_str)
+        # Schedule card
+        matches = []
+        for m in sorted(matches_raw, key=lambda x: x["utcDate"]):
+            group = (m.get("group","") or "").replace("GROUP_","Group ")
+            matches.append({"time":format_kickoff_et(m["utcDate"]),"home":m["homeTeam"]["name"],
+                            "away":m["awayTeam"]["name"],"group":group})
+        sched_path = str(TMP_DIR / ("schedule_"+tomorrow_str.replace("-","")+".png"))
+        sched_path = make_schedule_card(matches, date_str, dn, sched_path)
+        sched_caption = claude_schedule_caption(matches, date_str, dn, build_hashtag_block("","","group stage"))
+        register_card(sched_path, "schedule", sched_caption)
+        upload_dropbox(sched_path, Path(sched_path).name)
+        upload_github(sched_path, Path(sched_path).name)
+        save_caption_file(sched_caption, Path(sched_path).stem)
+        log.info("Tomorrow schedule uploaded: " + Path(sched_path).name)
+        # Prediction cards
+        for m in sorted(matches_raw, key=lambda x: x["utcDate"]):
+            home = m["homeTeam"]["name"]; away = m["awayTeam"]["name"]
+            group = (m.get("group","") or "").replace("GROUP_","Group ")
+            kickoff = format_kickoff_et(m["utcDate"])
+            venue = m.get("venue","") or ""
+            pred = claude_prediction(home, away, group, kickoff)
+            if not pred:
+                log.warning("No prediction for " + home + " vs " + away); continue
+            safe = "PRED_"+home.replace(" ","_")+"_vs_"+away.replace(" ","_")+"_"+tomorrow_str.replace("-","")
+            pred_path = str(TMP_DIR / (safe+".png"))
+            pred_path = make_pred_card(
+                home, away, group, venue, kickoff,
+                pred["pred_home"], pred["pred_away"],
+                pred["key_player"], pred["key_player_team"],
+                pred["reason"], pred["confidence"], pred_path
+            )
+            caption = pred["caption"] + "\n\n" + build_hashtag_block(home, away, "group stage")
+            register_card(pred_path, "prediction", caption)
+            upload_dropbox(pred_path, Path(pred_path).name)
+            upload_github(pred_path, Path(pred_path).name)
+            save_caption_file(caption, Path(pred_path).stem)
+            log.info("Tomorrow prediction uploaded: " + home + " vs " + away)
+            time.sleep(3)
+        mark_tomorrow_done()
+        log.info("Tomorrow content complete: " + date_str)
+    except Exception as e:
+        log.error(f"Tomorrow content job error: {e}", exc_info=True)
+
+# ── Direct-serve HTTP layer (PERMANENT FIX) ──────────────────────────────────
+# Replaces Dropbox-as-posting-path. Serves cards straight from /tmp/wc5, with
+# the file re-verified on disk at REQUEST time (not just at save time), so a
+# request can never return a stale, partial, or 0-byte file. No client-side
+# sync/cache layer sits between card generation and what you actually post.
+app = Flask(__name__)
+
+@app.get("/")
+def feed_page():
+    """Mobile-friendly feed: newest card first, tap-to-open, caption shown
+    underneath so you can copy/paste it straight into Instagram."""
+    reg = list(reversed(_load_registry()))
+    rows = []
+    for r in reg:
+        fp = TMP_DIR / r["filename"]
+        if not fp.exists():
+            continue  # never list a card that isn't actually on disk right now
+        cap_html = (r.get("caption","") or "").replace("\n", "<br>")
+        rows.append(f"""
+        <div style="border:1px solid #ddd;border-radius:10px;margin:14px;padding:10px;font-family:sans-serif">
+          <div style="font-size:12px;color:#888;text-transform:uppercase">{r['kind']} · {r['size_kb']}KB</div>
+          <a href="/card/{r['filename']}"><img src="/card/{r['filename']}" style="width:100%;border-radius:8px;margin:8px 0"></a>
+          <div style="font-size:14px;white-space:pre-wrap">{cap_html}</div>
+        </div>""")
+    body = "".join(rows) if rows else "<p style='font-family:sans-serif;margin:20px'>No cards yet.</p>"
+    return f"<html><body style='margin:0;background:#f4f4f4'>{body}</body></html>"
+
+@app.get("/card/<filename>")
+def serve_card(filename):
+    """Serve a single card, re-verifying it on disk at request time.
+    This is the line that actually fixes the bug: if the file is missing,
+    empty, or smaller than a real card could ever be, we 404/410 instead of
+    handing back a broken file for IG (or you) to choke on."""
+    safe_name = Path(filename).name  # no path traversal
+    fp = TMP_DIR / safe_name
+    if not fp.exists():
+        abort(404, description="Card not found on disk")
+    size_kb = fp.stat().st_size / 1024
+    if size_kb < 30:
+        log.error(f"Direct-serve refused {safe_name} — only {size_kb:.1f}KB on disk")
+        abort(410, description=f"Card is corrupted/incomplete ({size_kb:.1f}KB) — not serving")
+    return send_file(str(fp), mimetype="image/jpeg", conditional=False,
+                      max_age=0, etag=False)  # never let a CDN/browser cache a stale version
+
+@app.get("/feed.json")
+def feed_json():
+    """Machine-readable feed — this is what a future Graph API auto-poster
+    (or Buffer/Zapier/etc.) should read from instead of Dropbox."""
+    reg = list(reversed(_load_registry()))
+    base = request.host_url.rstrip("/")
+    out = []
+    for r in reg:
+        fp = TMP_DIR / r["filename"]
+        if not fp.exists():
+            continue
+        out.append({**r, "image_url": f"{base}/card/{r['filename']}"})
+    return jsonify(out)
+
+@app.get("/healthz")
+def healthz():
+    return jsonify({"status": "ok", "registered_cards": len(_load_registry())})
+
+def run_server():
+    log.info(f"Direct-serve HTTP server starting on port {PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+def main():
+    log.info("World Cup in 5 — Poller v2 starting")
+    download_fonts()
+    # Start the direct-serve HTTP layer in the background FIRST — this is now
+    # the path that matters for actually getting a postable file.
+    threading.Thread(target=run_server, daemon=True).start()
+    schedule.every(5).minutes.do(job_result_and_recap)  # 5 min = 12 calls/hr, safe for free tier
+    schedule.every().day.at("12:00").do(job_schedule_card)  # 8am ET = 12:00 UTC
+    # Recap fires via 5-min poll job_result_and_recap() — no fixed schedule needed
+    # ── API health check on startup ───────────────────────────────────────────
+    log.info("Checking football-data.org API...")
+    try:
+        test = fd_get("/competitions/WC")
+        if test:
+            log.info(f"API OK — competition: {test.get('name','World Cup')}")
+        else:
+            log.error("API returned empty response — check API key or rate limit")
+    except Exception as e:
+        log.error(f"API health check failed: {e}")
+    log.info("Running initial jobs...")
+    # Always regenerate schedule on startup — catches missed/wrong cards after redeploy
+    # Remove the done marker so it runs fresh regardless of prior state
+    sched_done = TMP_DIR / f"sched_{et_today().replace('-','')}.done"
+    if sched_done.exists():
+        sched_done.unlink()
+        log.info("Reset schedule done marker — will regenerate")
+    job_schedule_card()
+    job_result_cards()
+    # Only run recap on startup if it's after midnight ET (all games finished)
+    # This prevents recap from running mid-day when games are still pending
+    hour_et = et_now().hour
+    if hour_et >= 0 and hour_et < 6:  # midnight to 6am ET only
+        log.info("Post-midnight startup — checking if recap needed")
+        job_recap_card()
+    else:
+        log.info("Skipping recap on startup — not yet midnight ET")
+    log.info("Poller running.")
+    consecutive_errors = 0
+    while True:
+        try:
+            schedule.run_pending()
+            consecutive_errors = 0
+        except Exception as e:
+            consecutive_errors += 1
+            log.error(f"Poll loop error #{consecutive_errors}: {e}", exc_info=True)
+            if consecutive_errors >= 10:
+                log.critical("Too many consecutive errors — restarting loop state")
+                consecutive_errors = 0
+        time.sleep(30)
+
+if __name__ == "__main__":
     main()
 # ── Direct-serve card registry ───────────────────────────────────────────────
 # PERMANENT FIX for "jpgs that won't post to IG":
