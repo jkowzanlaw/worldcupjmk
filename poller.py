@@ -1164,7 +1164,7 @@ def recapped_day_number():
     return max(1, (d - start).days + 1)
 
 def tomorrow_key():
-    return f"tomorrow_day{recapped_day_number() + 1}"
+    return f"tomorrow_day{day_number() + 1}"
 
 def tomorrow_done():
     return (TMP_DIR / f"{tomorrow_key()}.done").exists()
@@ -1290,29 +1290,22 @@ def make_pred_card(home, away, group, venue, kickoff,
     return safe_save(img, output_path)
 
 def job_tomorrow_content():
-    """Generate next day's schedule + AI predictions — only after recap is done.
-    Computes 'tomorrow' relative to the broadcast day just recapped, NOT the
-    current wall-clock et_now() — otherwise running after midnight ET causes
-    this to skip an extra day (e.g. recap runs at 12:40am Tue covering Monday,
-    but et_now()+1day would wrongly be Wednesday instead of Tuesday)."""
+    """Generate next day's schedule + AI predictions.
+    Runs on a fixed evening schedule (registered as 11pm ET in main()),
+    INDEPENDENT of whether today's recap has posted yet. Schedule/prediction
+    cards only need tomorrow's fixture list — which is known well in advance
+    — not today's final results, so there's no reason to wait on the recap
+    the way there used to be. This lets Julia pre-program tomorrow's content
+    the night before instead of waiting for the last match of the night to
+    finish (which is often well after midnight ET)."""
     try:
         if tomorrow_done(): return
-        if not recap_done_today():
-            log.debug("Tomorrow content waiting for recap to complete first")
-            return
 
-        # Use the SAME recapped-day reference as tomorrow_key() so the date
-        # computed here always matches the done-marker that gated this job.
         now_et = et_now()
-        if now_et.hour < 6:
-            recapped_day_et = (now_et - timedelta(days=1))
-        else:
-            recapped_day_et = now_et
-
-        tomorrow_et = recapped_day_et + timedelta(days=1)
+        tomorrow_et = now_et + timedelta(days=1)
         tomorrow_str = tomorrow_et.strftime("%Y-%m-%d")
         date_str = tomorrow_et.strftime("%A, %B %-d")
-        dn = recapped_day_number() + 1
+        dn = day_number() + 1
         matches_raw = get_matches_for_et_date(tomorrow_str)
         if not matches_raw:
             log.info("No matches tomorrow — skipping tomorrow content")
@@ -1436,6 +1429,13 @@ def main():
     threading.Thread(target=run_server, daemon=True).start()
     schedule.every(5).minutes.do(job_result_and_recap)  # 5 min = 12 calls/hr, safe for free tier
     schedule.every().day.at("12:00").do(job_schedule_card)  # 8am ET = 12:00 UTC
+    schedule.every().day.at("03:00").do(job_tomorrow_content)  # 11pm ET = 03:00 UTC
+    # Runs independent of job_result_and_recap/recap status — see job_tomorrow_content
+    # docstring. This is what lets Julia pre-program tomorrow's schedule + predictions
+    # the night before instead of waiting for the last match to finish, which is often
+    # well after midnight ET. Also still called inside job_result_and_recap (with its
+    # own tomorrow_done() self-gate) as a fallback so content still gets generated even
+    # if the 11pm trigger is somehow missed on a given day.
     # Recap fires via 5-min poll job_result_and_recap() — no fixed schedule needed
     # ── API health check on startup ───────────────────────────────────────────
     log.info("Checking football-data.org API...")
