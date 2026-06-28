@@ -175,12 +175,95 @@ def claude_call(prompt, max_tokens=300):
         log.error(f"Claude API request exception: {e}")
         return None
 
-def claude_insight(home, away, hs, as_, stage):
+def get_team_standing_context(team_name):
+    """Return a short, human phrase describing where `team_name` sits in their
+    group right now, e.g. 'moves top of Group B' or 'stays level on points in
+    Group D'. Returns '' if standings can't be found/matched — callers should
+    treat this as optional flavor, not required data.
+    Reuses the same /competitions/WC/standings endpoint and fd_get cache that
+    job_recap_card already calls, so this adds no extra API load in practice
+    (90s cache means a result-card call right after a recap call is free)."""
+    try:
+        standings_data = fd_get("/competitions/WC/standings")
+        raw_standings = standings_data.get("standings", [])
+        for grp in raw_standings:
+            group_letter = grp.get("group","").replace("GROUP_","")
+            table = grp.get("table", [])
+            for row in table:
+                t = row["team"]
+                if team_name in (t.get("name",""), t.get("shortName","")):
+                    pos = row["position"]
+                    pts = row["points"]
+                    played = row["playedGames"]
+                    if pos == 1:
+                        return f"now top of Group {group_letter} on {pts} points"
+                    elif pos == 2:
+                        return f"now sit second in Group {group_letter} on {pts} points"
+                    elif pos == len(table):
+                        return f"sit bottom of Group {group_letter} after {played} games"
+                    else:
+                        return f"sit {pos}{'rd' if pos==3 else 'th'} in Group {group_letter} on {pts} points"
+        return ""
+    except Exception as e:
+        log.debug(f"get_team_standing_context failed for {team_name}: {e}")
+        return ""
+
+def halftime_phrase(match, home, away):
+    """Return a short phrase describing the half-time score if meaningfully
+    different from full-time (e.g. a comeback or a team pulling away in the
+    second half) — this is real, specific texture the free API tier DOES
+    provide but the poller wasn't reading before. Returns '' if half-time
+    data is missing or not narratively interesting (e.g. same as full-time)."""
+    try:
+        ht = match.get("score", {}).get("halfTime", {})
+        ht_h, ht_a = ht.get("home"), ht.get("away")
+        ft = match.get("score", {}).get("fullTime", {})
+        ft_h, ft_a = ft.get("home"), ft.get("away")
+        if ht_h is None or ht_a is None:
+            return ""
+        if (ht_h, ht_a) == (ft_h, ft_a):
+            return ""  # no second-half change worth mentioning
+
+        def leader(h, a):
+            if h > a: return "home"
+            if a > h: return "away"
+            return "draw"
+
+        ht_leader, ft_leader = leader(ht_h, ht_a), leader(ft_h, ft_a)
+        if ht_leader != "draw" and ft_leader != "draw" and ht_leader != ft_leader:
+            comeback_team = home if ft_leader == "home" else away
+            trailing_team = away if ft_leader == "home" else home
+            return (f"{comeback_team} trailed {ht_h}-{ht_a} at halftime before completing the turnaround "
+                    f"to beat {trailing_team}")
+        if ht_leader == "draw" and ft_leader != "draw":
+            pulling_team = home if ft_leader == "home" else away
+            return f"level {ht_h}-{ht_a} at the break before {pulling_team} pulled away"
+        # Same leader at HT and FT, but scoreline changed — still worth a mention
+        return f"{ht_h}-{ht_a} at halftime"
+    except Exception:
+        return ""
+
+def claude_insight(home, away, hs, as_, stage, ht_phrase="", standing_phrase=""):
+    """ht_phrase: e.g. '0-0 at halftime' or 'level 1-1 at the break before X pulled away'
+    standing_phrase: e.g. 'now top of Group B on 6 points' — describes whichever
+    team is more newsworthy to mention (winner, or both if a draw matters to both).
+    Both are optional flavor from real match data (half-time score, live
+    standings) that the free football-data.org tier DOES provide but weren't
+    being read before — this is what was missing, not a prompt-wording problem."""
+    context_bits = []
+    if ht_phrase:
+        context_bits.append(f"Half-time context: {ht_phrase}.")
+    if standing_phrase:
+        context_bits.append(f"Standings context: {standing_phrase}.")
+    context_str = " ".join(context_bits)
     result = claude_call(
-        f"Write ONE punchy sentence (max 18 words) as a match insight for Instagram. "
-        f"Match: {home} {hs}\u2013{as_} {away}. Stage: {stage}. "
+        f"Write ONE punchy sentence (max 22 words) as a match insight for Instagram. "
+        f"Match: {home} {hs}\u2013{as_} {away}. Stage: {stage}. {context_str} "
+        f"Use the half-time/standings context above if given — that's the specific, "
+        f"real detail that makes this sound like a journalist who watched the match, "
+        f"not a generic recap of the scoreline. "
         f"Sound like a sharp sports journalist. No quotes, no hashtags.",
-        max_tokens=80
+        max_tokens=90
     )
     if not result:
         if hs > as_: result = f"{home} take all three points with a {hs}\u2013{as_} victory."
@@ -188,20 +271,22 @@ def claude_insight(home, away, hs, as_, stage):
         else: result = f"{home} and {away} share the spoils in a {hs}\u2013{as_} draw."
     return result
 
-def claude_result_caption(home, away, hs, as_, stage, insight, hashtags):
+def claude_result_caption(home, away, hs, as_, stage, insight, hashtags, standing_phrase=""):
+    standing_line = f"STANDINGS: {standing_phrase}\n" if standing_phrase else ""
     prompt = (
         f"Write an Instagram caption for this World Cup result.\n\n"
         f"RESULT: {home} {hs}\u2013{as_} {away} | {stage}\n"
-        f"KEY INSIGHT: {insight}\n\n"
+        f"KEY INSIGHT: {insight}\n"
+        f"{standing_line}\n"
         f"FORMAT:\n"
         f"Line 1: Bold result statement with score (1 emoji max \u26bd or \U0001f525)\n"
         f"Line 2: One sharp tactical or storyline observation\n"
-        f"Line 3: What this result means for the tournament\n"
+        f"Line 3: What this result means for the tournament (use standings context if given)\n"
         f"[blank line]\n"
         f"{hashtags}\n\n"
         f"Rules: Max 150 words before hashtags. No cliches. Sound like an expert."
     )
-    result = claude_call(prompt, max_tokens=400)
+    result = claude_call(prompt, max_tokens=450)
     if not result:
         result = (
             f"\u26bd {home} {hs}\u2013{as_} {away}\n"
@@ -766,9 +851,15 @@ def job_result_cards():
             today = et_now().strftime("%B %-d, %Y")
             log.info(f"New result: {home} {hs}–{as_} {away}")
             try:
-                insight   = claude_insight(home, away, hs, as_, stage)
+                ht_phrase = halftime_phrase(match, home, away)
+                # Standing context: prefer the winner's (or, on a draw, home team's)
+                # standing — that's the side whose tournament position changed in
+                # the way most relevant to "what this means" framing.
+                standing_team = home if hs >= as_ else away
+                standing_phrase = get_team_standing_context(standing_team)
+                insight   = claude_insight(home, away, hs, as_, stage, ht_phrase, standing_phrase)
                 hashtags  = build_hashtag_block(home, away, stage)
-                caption   = claude_result_caption(home, away, hs, as_, stage, insight, hashtags)
+                caption   = claude_result_caption(home, away, hs, as_, stage, insight, hashtags, standing_phrase)
                 log.info(f"Insight: {insight}")
                 safe = f"{home.replace(' ','_')}_vs_{away.replace(' ','_')}_{mid}"
                 img_path = str(TMP_DIR / f"{safe}.png")
