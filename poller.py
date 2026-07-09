@@ -243,7 +243,136 @@ def halftime_phrase(match, home, away):
     except Exception:
         return ""
 
-def claude_insight(home, away, hs, as_, stage, ht_phrase="", standing_phrase=""):
+# ESPN cache — keyed by (home, away, utc_date_str) tuple
+_espn_cache = {}
+
+def espn_match_details(home, away, utc_date_str):
+    """Fetch goal scorers, cards, and key stats for a finished match from ESPN's
+    free public API (no key required). Returns a dict with:
+        scorers: list of strings like 'Bellingham 34', 'Kane 67 (pen)'
+        cards:   list of strings like 'Trippier (yellow, 52)', 'Rashford (red, 88)'
+        stats:   dict with 'possession_home', 'possession_away', 'shots_home', 'shots_away'
+        summary: short text summary suitable for inserting into a prompt
+    Returns {} on any error — callers must treat this as optional enrichment.
+
+    How matching works: ESPN doesn't share IDs with football-data.org, so we
+    fetch ESPN's scoreboard for the match date, then fuzzy-match by team name
+    substring (enough to find 'England' in 'England national football team').
+    We then hit the /summary endpoint to get the full event detail."""
+    cache_key = (home, away, utc_date_str)
+    if cache_key in _espn_cache:
+        return _espn_cache[cache_key]
+
+    try:
+        from datetime import datetime, timezone
+        # Parse UTC date to YYYYMMDD for ESPN
+        dt = datetime.fromisoformat(utc_date_str.replace("Z", "+00:00"))
+        date_str = dt.strftime("%Y%m%d")
+
+        ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world"
+
+        # Step 1: get scoreboard for that date
+        sb_url = f"{ESPN_BASE}/scoreboard?dates={date_str}&limit=20"
+        sb_resp = requests.get(sb_url, timeout=15)
+        if not sb_resp.ok:
+            log.warning(f"ESPN scoreboard {sb_resp.status_code} for {date_str}")
+            _espn_cache[cache_key] = {}
+            return {}
+
+        events = sb_resp.json().get("events", [])
+
+        # Step 2: fuzzy-match by team name
+        event_id = None
+        for event in events:
+            competitions = event.get("competitions", [])
+            if not competitions:
+                continue
+            competitors = competitions[0].get("competitors", [])
+            names = [c.get("team", {}).get("displayName", "").lower() for c in competitors]
+            if any(home.lower()[:6] in n for n in names) and \
+               any(away.lower()[:6] in n for n in names):
+                event_id = event.get("id")
+                break
+
+        if not event_id:
+            log.debug(f"ESPN: no event found for {home} vs {away} on {date_str}")
+            _espn_cache[cache_key] = {}
+            return {}
+
+        # Step 3: fetch full match summary
+        sum_url = f"{ESPN_BASE}/summary?event={event_id}"
+        sum_resp = requests.get(sum_url, timeout=15)
+        if not sum_resp.ok:
+            log.warning(f"ESPN summary {sum_resp.status_code} for event {event_id}")
+            _espn_cache[cache_key] = {}
+            return {}
+
+        data = sum_resp.json()
+
+        # Step 4: extract what actually matters for caption quality
+        scorers = []
+        cards = []
+
+        # Goals and cards live in scoring plays / key events
+        for comp in data.get("header", {}).get("competitions", []):
+            for detail in comp.get("details", []):
+                dtype = detail.get("type", {}).get("text", "").lower()
+                player = detail.get("athletesInvolved", [{}])[0].get("displayName", "")
+                clock = detail.get("clock", {}).get("displayValue", "")
+                team = detail.get("team", {}).get("displayName", "")
+                if not player:
+                    continue
+                if "goal" in dtype or "score" in dtype:
+                    pen = " (pen)" if "penalty" in dtype else ""
+                    og = " (OG)" if "own" in dtype else ""
+                    scorers.append(f"{player}{pen}{og} {clock}")
+                elif "yellow card" in dtype:
+                    cards.append(f"{player} (yellow, {clock})")
+                elif "red card" in dtype or "second yellow" in dtype:
+                    cards.append(f"{player} (red, {clock})")
+
+        # Match stats (possession, shots)
+        stats = {}
+        for comp in data.get("boxscore", {}).get("teams", []):
+            team_name = comp.get("team", {}).get("displayName", "")
+            is_home = home.lower()[:6] in team_name.lower()
+            prefix = "home" if is_home else "away"
+            for stat in comp.get("statistics", []):
+                name = stat.get("name", "")
+                val = stat.get("displayValue", "")
+                if name == "possessionPct":
+                    stats[f"possession_{prefix}"] = val
+                elif name == "totalShots":
+                    stats[f"shots_{prefix}"] = val
+
+        # Build a concise summary string for insertion into Claude's prompt
+        parts = []
+        if scorers:
+            parts.append("Scorers: " + ", ".join(scorers))
+        if cards:
+            parts.append("Cards: " + ", ".join(cards))
+        if "possession_home" in stats and "possession_away" in stats:
+            parts.append(f"Possession: {home} {stats['possession_home']}% – {away} {stats['possession_away']}%")
+        if "shots_home" in stats and "shots_away" in stats:
+            parts.append(f"Shots: {home} {stats['shots_home']} – {away} {stats['shots_away']}")
+
+        result = {
+            "scorers": scorers,
+            "cards": cards,
+            "stats": stats,
+            "summary": ". ".join(parts) if parts else ""
+        }
+        _espn_cache[cache_key] = result
+        if result["summary"]:
+            log.info(f"ESPN enrichment for {home} vs {away}: {result['summary'][:120]}")
+        return result
+
+    except Exception as e:
+        log.warning(f"ESPN enrichment failed for {home} vs {away}: {e}")
+        _espn_cache[cache_key] = {}
+        return {}
+
+def claude_insight(home, away, hs, as_, stage, ht_phrase="", standing_phrase="", espn_summary=""):
     """ht_phrase: e.g. '0-0 at halftime' or 'level 1-1 at the break before X pulled away'
     standing_phrase: e.g. 'now top of Group B on 6 points' — describes whichever
     team is more newsworthy to mention (winner, or both if a draw matters to both).
@@ -251,10 +380,12 @@ def claude_insight(home, away, hs, as_, stage, ht_phrase="", standing_phrase="")
     standings) that the free football-data.org tier DOES provide but weren't
     being read before — this is what was missing, not a prompt-wording problem."""
     context_bits = []
+    if espn_summary:
+        context_bits.append(f"Match facts: {espn_summary}.")
     if ht_phrase:
-        context_bits.append(f"Half-time context: {ht_phrase}.")
+        context_bits.append(f"Half-time: {ht_phrase}.")
     if standing_phrase:
-        context_bits.append(f"Standings context: {standing_phrase}.")
+        context_bits.append(f"Standings: {standing_phrase}.")
     context_str = " ".join(context_bits)
     result = claude_call(
         f"Write ONE punchy sentence (max 22 words) as a match insight for Instagram. "
@@ -271,20 +402,22 @@ def claude_insight(home, away, hs, as_, stage, ht_phrase="", standing_phrase="")
         else: result = f"{home} and {away} share the spoils in a {hs}\u2013{as_} draw."
     return result
 
-def claude_result_caption(home, away, hs, as_, stage, insight, hashtags, standing_phrase=""):
+def claude_result_caption(home, away, hs, as_, stage, insight, hashtags, standing_phrase="", espn_summary=""):
     standing_line = f"STANDINGS: {standing_phrase}\n" if standing_phrase else ""
+    espn_line = f"MATCH FACTS: {espn_summary}\n" if espn_summary else ""
     prompt = (
         f"Write an Instagram caption for this World Cup result.\n\n"
         f"RESULT: {home} {hs}\u2013{as_} {away} | {stage}\n"
         f"KEY INSIGHT: {insight}\n"
+        f"{espn_line}"
         f"{standing_line}\n"
         f"FORMAT:\n"
         f"Line 1: Bold result statement with score (1 emoji max \u26bd or \U0001f525)\n"
-        f"Line 2: One sharp tactical or storyline observation\n"
+        f"Line 2: One sharp observation — use goal scorers or cards from MATCH FACTS if available\n"
         f"Line 3: What this result means for the tournament (use standings context if given)\n"
         f"[blank line]\n"
         f"{hashtags}\n\n"
-        f"Rules: Max 150 words before hashtags. No cliches. Sound like an expert."
+        f"Rules: Max 150 words before hashtags. No cliches. Sound like an expert who watched the match."
     )
     result = claude_call(prompt, max_tokens=450)
     if not result:
@@ -852,14 +985,15 @@ def job_result_cards():
             log.info(f"New result: {home} {hs}–{as_} {away}")
             try:
                 ht_phrase = halftime_phrase(match, home, away)
-                # Standing context: prefer the winner's (or, on a draw, home team's)
-                # standing — that's the side whose tournament position changed in
-                # the way most relevant to "what this means" framing.
                 standing_team = home if hs >= as_ else away
                 standing_phrase = get_team_standing_context(standing_team)
-                insight   = claude_insight(home, away, hs, as_, stage, ht_phrase, standing_phrase)
+                # ESPN enrichment — free, no key required, provides goal scorers
+                # and cards that football-data.org's free tier doesn't include
+                espn = espn_match_details(home, away, match.get("utcDate",""))
+                espn_summary = espn.get("summary", "")
+                insight   = claude_insight(home, away, hs, as_, stage, ht_phrase, standing_phrase, espn_summary)
                 hashtags  = build_hashtag_block(home, away, stage)
-                caption   = claude_result_caption(home, away, hs, as_, stage, insight, hashtags, standing_phrase)
+                caption   = claude_result_caption(home, away, hs, as_, stage, insight, hashtags, standing_phrase, espn_summary)
                 log.info(f"Insight: {insight}")
                 safe = f"{home.replace(' ','_')}_vs_{away.replace(' ','_')}_{mid}"
                 img_path = str(TMP_DIR / f"{safe}.png")
